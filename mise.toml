@@ -1,0 +1,4 @@
+[tools]
+cargo-binstall = "1.15.6"
+"cargo:cargo-xwin" = "0.20.1"
+"cargo:cargo-zigbuild" = "0.20.1"

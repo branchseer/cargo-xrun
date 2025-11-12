@@ -1,0 +1,23 @@
+[package]
+name = "cargo-xrun"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "cargo-xrun"
+path = "src/xrun.rs"
+
+[[bin]]
+name = "cargo-xtest"
+path = "src/xtest.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+cargo-options = "0.7.6"
+clap = { version = "4.5.51", features = ["derive", "env", "wrap_help", "unstable-styles"] }
+clap-cargo = "0.18.3"
+dirs = "6.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_spanned = "1.0"
+toml_edit = { version = "0.23.7", features = ["serde"] }
+
