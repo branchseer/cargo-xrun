@@ -35,7 +35,7 @@ pub enum UserResponse {
 /// 3. return the newly created or updated host.
 ///
 /// Returns an error if the TOML is malformed or has invalid schema.
-fn upsert_with(
+pub fn upsert_with(
     toml_config_str: &mut String,
     target: &str,
     f: impl FnOnce(&[Host]) -> UserResponse,
