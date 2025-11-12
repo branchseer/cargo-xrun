@@ -48,26 +48,26 @@ pub fn upsert_with(
         .context("Failed to parse TOML configuration")?;
 
     // Get hosts array - handle both array of tables, empty array, and missing
-    let hosts_array = match &doc["host"] {
-        Item::ArrayOfTables(arr) => arr,
-        Item::None => {
+    let hosts_array = match doc.get("host") {
+        Some(Item::ArrayOfTables(arr)) => arr,
+        None => {
             // Non-existent - create empty array of tables
             doc["host"] = Item::ArrayOfTables(ArrayOfTables::new());
             doc["host"]
                 .as_array_of_tables()
                 .ok_or_else(|| anyhow!("Failed to create hosts array"))?
         }
-        Item::Value(val) if val.is_array() && val.as_array().map_or(false, |a| a.is_empty()) => {
+        Some(Item::Value(val)) if val.is_array() && val.as_array().map_or(false, |a| a.is_empty()) => {
             // Empty regular array - convert to array of tables
             doc["host"] = Item::ArrayOfTables(ArrayOfTables::new());
             doc["host"]
                 .as_array_of_tables()
                 .ok_or_else(|| anyhow!("Failed to create hosts array"))?
         }
-        _ => {
+        Some(item) => {
             return Err(anyhow!(
                 "'host' field must be an array of tables, found: {}",
-                doc["host"].type_name()
+                item.type_name()
             ));
         }
     };
@@ -364,6 +364,26 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]  # inline comment
             r#"host = []
 "#,
         );
+
+        let result = upsert_with(&mut config_str, "aarch64-apple-darwin", |hosts| {
+            assert_eq!(hosts.len(), 0);
+            Ok(UserResponse::AddNewHost {
+                destination: "user@firsthost.com".to_string(),
+            })
+        })
+        .expect("test should succeed");
+
+        assert_eq!(result.destination, "user@firsthost.com");
+        assert_eq!(result.targets, vec!["aarch64-apple-darwin".to_string()]);
+
+        // Verify the new host was added
+        assert!(config_str.contains("user@firsthost.com"));
+        assert!(config_str.contains(r#"targets = ["aarch64-apple-darwin"]"#));
+    }
+
+    #[test]
+    fn test_upsert_with_completely_empty_string() {
+        let mut config_str = String::from("");
 
         let result = upsert_with(&mut config_str, "aarch64-apple-darwin", |hosts| {
             assert_eq!(hosts.len(), 0);
