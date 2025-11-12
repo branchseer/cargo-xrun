@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_spanned::Spanned;
 
@@ -38,9 +38,9 @@ pub enum UserResponse {
 pub fn upsert_with(
     toml_config_str: &mut String,
     target: &str,
-    f: impl FnOnce(&[Host]) -> UserResponse,
-) -> Result<Host> {
-    use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
+    f: impl FnOnce(&[Host]) -> anyhow::Result<UserResponse>,
+) -> anyhow::Result<Host> {
+    use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
     // Parse the TOML document with span information for better errors
     let mut doc = toml_config_str
@@ -93,7 +93,11 @@ pub fn upsert_with(
             .and_then(|item| item.as_array())
             .ok_or_else(|| {
                 let type_name = targets_item.map(|i| i.type_name()).unwrap_or("none");
-                anyhow!("host[{}].targets must be an array, found: {}", idx, type_name)
+                anyhow!(
+                    "host[{}].targets must be an array, found: {}",
+                    idx,
+                    type_name
+                )
             })?;
 
         let mut targets = Vec::new();
@@ -123,7 +127,7 @@ pub fn upsert_with(
     }
 
     // Target doesn't exist, get user's choice
-    let user_response = f(&hosts);
+    let user_response = f(&hosts)?;
 
     match user_response {
         UserResponse::AddTargetToHost { host_index } => {
@@ -132,9 +136,7 @@ pub fn upsert_with(
                 .as_array_of_tables_mut()
                 .ok_or_else(|| anyhow!("'host' is not an array of tables"))?;
 
-            let host_table = hosts_array
-                .get_mut(host_index)
-                .expect("Invalid host_index");
+            let host_table = hosts_array.get_mut(host_index).expect("Invalid host_index");
 
             let targets_array = host_table["targets"]
                 .as_array_mut()
@@ -229,7 +231,7 @@ targets = ["x86_64-unknown-linux-gnu"]
         let result = upsert_with(&mut config_str, "x86_64-apple-darwin", |hosts| {
             assert_eq!(hosts.len(), 2);
             assert_eq!(hosts[0].destination, "user@server1.com");
-            UserResponse::AddTargetToHost { host_index: 0 }
+            Ok(UserResponse::AddTargetToHost { host_index: 0 })
         })
         .expect("test should succeed");
 
@@ -240,7 +242,9 @@ targets = ["x86_64-unknown-linux-gnu"]
 
         // Verify the config string was updated
         assert_ne!(config_str, original_config);
-        assert!(config_str.contains(r#"targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]"#));
+        assert!(
+            config_str.contains(r#"targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]"#)
+        );
 
         // Verify second host is unchanged
         assert!(config_str.contains("user@server2.com"));
@@ -264,23 +268,28 @@ targets = ["x86_64-unknown-linux-gnu"]
         let result = upsert_with(&mut config_str, "aarch64-unknown-linux-gnu", |hosts| {
             assert_eq!(hosts.len(), 2);
             assert_eq!(hosts[1].destination, "user@server2.com");
-            UserResponse::AddTargetToHost { host_index: 1 }
+            Ok(UserResponse::AddTargetToHost { host_index: 1 })
         })
         .expect("test should succeed");
 
         assert_eq!(result.destination, "user@server2.com");
         assert_eq!(result.targets.len(), 2);
-        assert!(result
-            .targets
-            .contains(&"x86_64-unknown-linux-gnu".to_string()));
-        assert!(result
-            .targets
-            .contains(&"aarch64-unknown-linux-gnu".to_string()));
+        assert!(
+            result
+                .targets
+                .contains(&"x86_64-unknown-linux-gnu".to_string())
+        );
+        assert!(
+            result
+                .targets
+                .contains(&"aarch64-unknown-linux-gnu".to_string())
+        );
 
         // Verify the config string was updated correctly
-        assert!(config_str.contains(
-            r#"targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]"#
-        ));
+        assert!(
+            config_str
+                .contains(r#"targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]"#)
+        );
     }
 
     #[test]
@@ -295,17 +304,19 @@ targets = ["aarch64-apple-darwin"]
         // Add a completely new host
         let result = upsert_with(&mut config_str, "x86_64-unknown-linux-gnu", |hosts| {
             assert_eq!(hosts.len(), 1);
-            UserResponse::AddNewHost {
+            Ok(UserResponse::AddNewHost {
                 destination: "user@newserver.com".to_string(),
-            }
+            })
         })
         .expect("test should succeed");
 
         assert_eq!(result.destination, "user@newserver.com");
         assert_eq!(result.targets.len(), 1);
-        assert!(result
-            .targets
-            .contains(&"x86_64-unknown-linux-gnu".to_string()));
+        assert!(
+            result
+                .targets
+                .contains(&"x86_64-unknown-linux-gnu".to_string())
+        );
 
         // Verify both hosts exist in the config
         assert!(config_str.contains("user@server1.com"));
@@ -330,7 +341,7 @@ targets = ["aarch64-apple-darwin"]  # inline comment
 
         // Add target to existing host - should preserve comments
         upsert_with(&mut config_str, "x86_64-apple-darwin", |_hosts| {
-            UserResponse::AddTargetToHost { host_index: 0 }
+            Ok(UserResponse::AddTargetToHost { host_index: 0 })
         })
         .expect("test should succeed");
 
@@ -356,9 +367,9 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]  # inline comment
 
         let result = upsert_with(&mut config_str, "aarch64-apple-darwin", |hosts| {
             assert_eq!(hosts.len(), 0);
-            UserResponse::AddNewHost {
+            Ok(UserResponse::AddNewHost {
                 destination: "user@firsthost.com".to_string(),
-            }
+            })
         })
         .expect("test should succeed");
 
@@ -402,9 +413,9 @@ targets = [
 
         // Add new host - multiline formatting should be preserved where possible
         upsert_with(&mut config_str, "x86_64-unknown-linux-gnu", |_hosts| {
-            UserResponse::AddNewHost {
+            Ok(UserResponse::AddNewHost {
                 destination: "user@server2.com".to_string(),
-            }
+            })
         })
         .expect("test should succeed");
 
@@ -436,7 +447,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 
         // Add target to second host
         upsert_with(&mut config_str, "aarch64-unknown-linux-gnu", |_hosts| {
-            UserResponse::AddTargetToHost { host_index: 1 }
+            Ok(UserResponse::AddTargetToHost { host_index: 1 })
         })
         .expect("test should succeed");
 
@@ -480,7 +491,7 @@ targets = ["target2"]  # inline 3
 
         // Add target to first host
         upsert_with(&mut config_str, "new-target", |_hosts| {
-            UserResponse::AddTargetToHost { host_index: 0 }
+            Ok(UserResponse::AddTargetToHost { host_index: 0 })
         })
         .expect("test should succeed");
 
@@ -639,7 +650,7 @@ targets = ["target1"]
         // First, corrupt the internal structure by manually editing
         // This tests the error handling during the mutation phase
         let result = upsert_with(&mut config_str, "new-target", |_hosts| {
-            UserResponse::AddTargetToHost { host_index: 0 }
+            Ok(UserResponse::AddTargetToHost { host_index: 0 })
         });
 
         // This should succeed
@@ -649,7 +660,7 @@ targets = ["target1"]
         config_str = config_str.replace("targets = [", "targets = ");
 
         let result2 = upsert_with(&mut config_str, "another-target", |_hosts| {
-            UserResponse::AddTargetToHost { host_index: 0 }
+            Ok(UserResponse::AddTargetToHost { host_index: 0 })
         });
 
         assert!(result2.is_err());
@@ -682,4 +693,3 @@ targets = ["target3"]
         assert!(err_msg.contains("host[1].destination must be a string"));
     }
 }
-
