@@ -1,13 +1,16 @@
 mod runner;
-mod targets;
+mod ssh_master;
+mod fs_server;
 
 use std::{
     env::{self, args_os, current_exe},
     ffi::{OsStr, OsString},
+    path::PathBuf,
     process::Command,
 };
 
 use clap::Parser;
+use which::which;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,12 +23,18 @@ enum Opt {
     /// Run a binary or example of the local package remotely
     #[command(name = "xrun", aliases = ["run", "r"])]
     XRun {
+        /// Build and run for the target triple
+        #[clap(name = "target", long, required = true)]
+        triple: String,
         /// Arguments for `cargo run`. Check `cargo help run` for details.
         #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
         cargo_run_args: Vec<OsString>,
     },
     #[command(name = "xtest", aliases = ["test", "t"])]
     XTest {
+        /// Build and run for the target triple
+        #[clap(name = "target", long, required = true)]
+        triple: String,
         /// Arguments for `cargo test`. Check `cargo help test` for details.
         #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
         cargo_test_args: Vec<OsString>,
@@ -33,12 +42,19 @@ enum Opt {
 }
 
 fn exec_cargo(
+    alt_cargo: Option<&str>,
     subcommand: &str,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     envs: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
 ) -> anyhow::Error {
+    let alt_cargo_path = alt_cargo
+        .and_then(|cmd| which(cmd).ok())
+        .map(PathBuf::into_os_string);
+
     // https://github.com/rust-cross/cargo-zigbuild/blob/75aca8d5f0230a4cf3f116a0b6ab24c7b6124926/src/bin/cargo-zigbuild.rs#L92
-    let mut cargo_command = Command::new(env::var_os("CARGO").unwrap_or("cargo".into()));
+    let mut cargo_command = Command::new(
+        alt_cargo_path.unwrap_or_else(|| env::var_os("CARGO").unwrap_or("cargo".into())),
+    );
     cargo_command
         .arg(subcommand)
         .args(args)
@@ -56,6 +72,22 @@ fn exec_cargo(
 }
 
 pub fn cli_main() -> anyhow::Result<()> {
+    const RUNNER_MODE_SUBCOMMAND: &str = "cargo-xrun-runner-mode";
+
+    let mut args = args_os();
+    if let Some(_program_name) = args.next()
+        && let Some(subcommand) = args.next()
+        && subcommand == RUNNER_MODE_SUBCOMMAND
+    {
+        let target = args.next().expect("target argument missing");
+        let target = target.to_str().expect("invalid target string");
+        let exe = args.next().expect("executable argument missing");
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return tokio_rt.block_on(runner::runner(target, &exe));
+    }
+
     let current_exe_path = current_exe()?.into_os_string();
     if contains_space(&current_exe_path) {
         eprintln!(
@@ -68,41 +100,57 @@ pub fn cli_main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    const RUNNER_MODE_SUBCOMMAND: &str = "cargo-xrun-runner-mode";
-
-    let mut args = args_os();
-    if let Some(_program_name) = args.next()
-        && let Some(subcommand) = args.next()
-        && subcommand == RUNNER_MODE_SUBCOMMAND
-    {
-        let target = args.next().expect("target argument missing");
-        let target = target.to_str().expect("invalid target string");
-        let exe = args.next().expect("executable argument missing");
-        return runner::runner(target, &exe);
-    }
-
     let opt = Opt::parse();
-    let (cargo_subcommand, args) = match opt {
-        Opt::XRun { cargo_run_args } => ("run", cargo_run_args),
-        Opt::XTest { cargo_test_args } => ("test", cargo_test_args),
+
+    let (cargo_subcommand, triple, args) = match opt {
+        Opt::XRun {
+            triple,
+            cargo_run_args,
+        } => ("run", triple, cargo_run_args),
+        Opt::XTest {
+            triple,
+            cargo_test_args,
+        } => ("test", triple, cargo_test_args),
     };
 
-    let runner_envs = targets::TARGETS.iter().map(|target| {
-        let mut runner_value = current_exe_path.clone();
-        runner_value.push(" ");
-        runner_value.push(RUNNER_MODE_SUBCOMMAND);
-        runner_value.push(" ");
-        runner_value.push(target);
-        (
-            OsString::from(format!(
-                "CARGO_TARGET_{}_RUNNER",
-                target.to_uppercase().replace('-', "_"),
-            )),
-            runner_value,
-        )
-    });
+    let alt_cargo = if triple.contains("windows") {
+        Some("cargo-xwin")
+    } else if triple.contains("linux") {
+        Some("cargo-zigbuild")
+    } else {
+        None
+    };
 
-    return Err(exec_cargo(cargo_subcommand, args, runner_envs));
+    let args = args
+        .iter()
+        .map(|arg| arg.as_os_str())
+        .chain([OsStr::new("--target"), OsStr::new(&triple)]);
+
+    let runner_env = (
+        OsString::from(format!(
+            "CARGO_TARGET_{}_RUNNER",
+            triple.to_uppercase().replace('-', "_"),
+        )),
+        {
+            let mut runner_command = current_exe_path.clone();
+            runner_command.push(" ");
+            runner_command.push(RUNNER_MODE_SUBCOMMAND);
+            runner_command.push(" ");
+            runner_command.push(&triple);
+            runner_command.push(" ");
+            // The executable path will be appended by cargo automatically
+            runner_command
+        },
+    );
+
+
+
+    return Err(exec_cargo(
+        alt_cargo,
+        cargo_subcommand,
+        args,
+        std::iter::once(runner_env),
+    ));
 }
 
 fn contains_space(s: impl AsRef<OsStr>) -> bool {
