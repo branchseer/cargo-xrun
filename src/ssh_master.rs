@@ -1,5 +1,6 @@
 use std::{
     any,
+    mem::ManuallyDrop,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
 };
@@ -12,19 +13,24 @@ use tokio::{
     process::Command,
 };
 
-struct SshMaster {
+pub struct SshMaster {
     control_path: NamedTempFile<PathBuf>,
     master_daemon: InterruptibleChild,
     remote_port: u16,
 }
 
 impl SshMaster {
+    pub fn control_path(&self) -> &Path {
+        self.control_path.as_file().as_path()
+    }
+    pub fn remote_port(&self) -> u16 {
+        self.remote_port
+    }
     pub async fn start(ssh_destination: &str, forward_port: u16) -> anyhow::Result<Self> {
         let control_path = tempfile::Builder::new().make(|path: &Path| Ok(path.to_path_buf()))?;
 
         let mut master_daemon = Command::new("ssh")
             .args([
-                "-N", // no command execution
                 "-R",
                 &format!("0:localhost:{}", forward_port), // remote port forwarding
                 "-o",
@@ -34,6 +40,7 @@ impl SshMaster {
             ])
             .arg(control_path.as_file().as_os_str())
             .arg(ssh_destination)
+            .arg("sc start WebClient >nul 2>nul & pause >nul 2>nul")
             .stderr(Stdio::piped())
             .spawn_interruptible()
             .context("Failed to spawn ssh master daemon")?;
@@ -79,6 +86,15 @@ impl SshMaster {
 
     pub async fn stop(mut self) -> anyhow::Result<ExitStatus> {
         self.master_daemon.interrupt()?;
-        Ok(self.master_daemon.wait().await?)
+        let mut me = ManuallyDrop::new(self);
+        Ok(me.master_daemon.wait().await?)
+    }
+}
+
+impl Drop for SshMaster {
+    fn drop(&mut self) {
+        if let Err(err) = self.master_daemon.interrupt() {
+            tracing::warn!("Failed to interrupt ssh master daemon: {:?}", err);
+        }
     }
 }

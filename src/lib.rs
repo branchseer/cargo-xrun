@@ -1,13 +1,16 @@
+mod config;
+mod fs_server;
 mod runner;
 mod ssh_master;
-mod fs_server;
 
+use ssh_master::SshMaster;
 use std::{
     env::{self, args_os, current_exe},
     ffi::{OsStr, OsString},
     path::PathBuf,
-    process::Command,
+    process::{ExitCode, ExitStatus},
 };
+use tokio::process::Command;
 
 use clap::Parser;
 use which::which;
@@ -41,12 +44,12 @@ enum Opt {
     },
 }
 
-fn exec_cargo(
+async fn exec_cargo(
     alt_cargo: Option<&str>,
     subcommand: &str,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     envs: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
-) -> anyhow::Error {
+) -> anyhow::Result<ExitStatus> {
     let alt_cargo_path = alt_cargo
         .and_then(|cmd| which(cmd).ok())
         .map(PathBuf::into_os_string);
@@ -61,18 +64,14 @@ fn exec_cargo(
         .env_remove("CARGO")
         .envs(envs);
 
-    #[cfg(unix)]
-    return std::os::unix::process::CommandExt::exec(&mut cargo_command).into();
-
-    #[cfg(not(unix))]
-    match cargo_command.status() {
-        Err(err) => err.into(),
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-    }
+    Ok(cargo_command.status().await?)
 }
 
-pub fn cli_main() -> anyhow::Result<()> {
+pub async fn cli_main() -> anyhow::Result<ExitCode> {
     const RUNNER_MODE_SUBCOMMAND: &str = "cargo-xrun-runner-mode";
+    const SSH_CTRL_PATH_ENV_NAME: &str = "CARGOXRUN_SSH_CTRL_PATH";
+    const SSH_REMOTE_FS_SERVER_PORT: &str = "CARGOXRUN_SSH_REMOTE_FS_SERVER_PORT";
+    const SSH_DESTINATION_ENV_NAME: &str = "CARGOXRUN_SSH_DESTINATION";
 
     let mut args = args_os();
     if let Some(_program_name) = args.next()
@@ -82,10 +81,25 @@ pub fn cli_main() -> anyhow::Result<()> {
         let target = args.next().expect("target argument missing");
         let target = target.to_str().expect("invalid target string");
         let exe = args.next().expect("executable argument missing");
-        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        return tokio_rt.block_on(runner::runner(target, &exe));
+        let ssh_ctrl_path = env::var_os(SSH_CTRL_PATH_ENV_NAME)
+            .expect("CARGOXRUN_SSH_CTRL_PATH environment variable missing");
+        let ssh_remote_fs_server_port: u16 = env::var_os(SSH_REMOTE_FS_SERVER_PORT)
+            .expect("CARGOXRUN_SSH_REMOTE_FS_SERVER_PORT environment variable missing")
+            .to_str()
+            .and_then(|s| s.parse().ok())
+            .expect("invalid CARGOXRUN_SSH_REMOTE_FS_SERVER_PORT value");
+        let ssh_destination = env::var_os(SSH_DESTINATION_ENV_NAME)
+            .expect("CARGOXRUN_SSH_DESTINATION environment variable missing")
+            .into_string()
+            .expect("invalid CARGOXRUN_SSH_DESTINATION value");
+        return runner::runner(
+            target,
+            &exe,
+            &ssh_ctrl_path,
+            ssh_remote_fs_server_port,
+            &ssh_destination,
+        )
+        .await;
     }
 
     let current_exe_path = current_exe()?.into_os_string();
@@ -126,31 +140,57 @@ pub fn cli_main() -> anyhow::Result<()> {
         .map(|arg| arg.as_os_str())
         .chain([OsStr::new("--target"), OsStr::new(&triple)]);
 
-    let runner_env = (
-        OsString::from(format!(
-            "CARGO_TARGET_{}_RUNNER",
-            triple.to_uppercase().replace('-', "_"),
-        )),
-        {
-            let mut runner_command = current_exe_path.clone();
-            runner_command.push(" ");
-            runner_command.push(RUNNER_MODE_SUBCOMMAND);
-            runner_command.push(" ");
-            runner_command.push(&triple);
-            runner_command.push(" ");
-            // The executable path will be appended by cargo automatically
-            runner_command
-        },
-    );
+    let runner_env_name = OsString::from(format!(
+        "CARGO_TARGET_{}_RUNNER",
+        triple.to_uppercase().replace('-', "_"),
+    ));
 
+    let runner_env_value = {
+        let mut runner_command = current_exe_path.clone();
+        runner_command.push(" ");
+        runner_command.push(RUNNER_MODE_SUBCOMMAND);
+        runner_command.push(" ");
+        runner_command.push(&triple);
+        runner_command.push(" ");
+        // The executable path will be appended by cargo automatically
+        runner_command
+    };
 
+    let ssh_destination = config::get_ssh_destination(&triple)?;
 
-    return Err(exec_cargo(
+    let (dav_port, server_fut) = fs_server::serve_webdav().await?;
+    tokio::spawn(server_fut);
+
+    let ssh_master = SshMaster::start(&ssh_destination, dav_port).await?;
+
+    let cargo_status = exec_cargo(
         alt_cargo,
         cargo_subcommand,
         args,
-        std::iter::once(runner_env),
-    ));
+        [
+            (runner_env_name.as_os_str(), runner_env_value.as_os_str()),
+            (
+                OsStr::new(SSH_CTRL_PATH_ENV_NAME),
+                ssh_master.control_path().as_os_str(),
+            ),
+            (
+                OsStr::new(SSH_CTRL_PATH_ENV_NAME),
+                ssh_master.control_path().as_os_str(),
+            ),
+            (
+                OsStr::new(SSH_REMOTE_FS_SERVER_PORT),
+                OsStr::new(&ssh_master.remote_port().to_string()),
+            ),
+            (
+                OsStr::new(SSH_DESTINATION_ENV_NAME),
+                OsStr::new(&ssh_destination),
+            ),
+        ],
+    )
+    .await?;
+
+    let _ = ssh_master.stop().await?;
+    Ok((cargo_status.code().unwrap_or(1) as u8).into())
 }
 
 fn contains_space(s: impl AsRef<OsStr>) -> bool {
