@@ -80,7 +80,7 @@ pub async fn cli_main() -> anyhow::Result<ExitCode> {
     {
         let target = args.next().expect("target argument missing");
         let target = target.to_str().expect("invalid target string");
-        let exe = args.next().expect("executable argument missing");
+
         let ssh_ctrl_path = env::var_os(SSH_CTRL_PATH_ENV_NAME)
             .expect("CARGOXRUN_SSH_CTRL_PATH environment variable missing");
         let ssh_remote_fs_server_port: u16 = env::var_os(SSH_REMOTE_FS_SERVER_PORT)
@@ -94,7 +94,7 @@ pub async fn cli_main() -> anyhow::Result<ExitCode> {
             .expect("invalid CARGOXRUN_SSH_DESTINATION value");
         return runner::runner(
             target,
-            &exe,
+            args,
             &ssh_ctrl_path,
             ssh_remote_fs_server_port,
             &ssh_destination,
@@ -135,10 +135,9 @@ pub async fn cli_main() -> anyhow::Result<ExitCode> {
         None
     };
 
-    let args = args
-        .iter()
-        .map(|arg| arg.as_os_str())
-        .chain([OsStr::new("--target"), OsStr::new(&triple)]);
+    let args = [OsStr::new("--target"), OsStr::new(&triple)]
+        .into_iter()
+        .chain(args.iter().map(|arg| arg.as_os_str()));
 
     let runner_env_name = OsString::from(format!(
         "CARGO_TARGET_{}_RUNNER",

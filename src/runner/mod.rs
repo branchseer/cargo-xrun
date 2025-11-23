@@ -10,7 +10,7 @@ use tokio::process::Command;
 
 pub async fn runner(
     target: &str,
-    exe: &OsStr,
+    mut args: impl Iterator<Item = impl AsRef<OsStr>>,
     ssh_ctrl_path: &OsStr,
     ssh_remote_fs_server_port: u16,
     ssh_destination: &str,
@@ -61,7 +61,8 @@ pub async fn runner(
         .arg(ssh_ctrl_path)
         .args(["-o", "PreferredAuthentications=none"]) // force to use control path
         .arg(ssh_destination)
-        .arg("cmd").arg("/c");
+        .arg("cmd")
+        .arg("/c");
 
     for (env_name, env_value) in envs {
         command.arg("set");
@@ -69,7 +70,9 @@ pub async fn runner(
         command.arg("&&");
     }
 
-    command.arg(to_remote_path(exe)?);
+    let exe = args.next().context("executable argument missing")?;
+    command.arg(to_remote_path(exe.as_ref())?);
+    command.args(args);
 
     let status = command.status().await?;
     Ok((status.code().unwrap_or(1) as u8).into())
