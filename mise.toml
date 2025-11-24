@@ -1,6 +1,5 @@
 [tools]
 cargo-binstall = "1.15.6"
-"cargo:cargo-autoinherit" = "0.1.6"
 "cargo:cargo-xwin" = "0.20.2"
 "cargo:cargo-zigbuild" = "0.20.1"
 deno = "2.5.6"
