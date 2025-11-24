@@ -128,6 +128,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cargo-options",
+ "cargo_xrun_client",
  "clap",
  "clap-cargo",
  "dav-server",
@@ -149,6 +150,10 @@ dependencies = [
  "tracing",
  "which",
 ]
+
+[[package]]
+name = "cargo_xrun_client"
+version = "0.1.0"
 
 [[package]]
 name = "cfg-if"

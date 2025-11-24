@@ -12,27 +12,61 @@ name = "cargo-xtest"
 path = "src/xtest.rs"
 
 [dependencies]
+anyhow = { workspace = true }
+cargo-options = { workspace = true }
+clap = { workspace = true, features = [
+    "derive",
+    "env",
+    "wrap_help",
+    "unstable-styles",
+] }
+clap-cargo = { workspace = true }
+dav-server = { workspace = true }
+dirs = { workspace = true }
+headers = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+inquire = { workspace = true }
+rand = { workspace = true }
+relative-path = { workspace = true }
+send_ctrlc = { workspace = true, features = ["tokio"] }
+serde = { workspace = true, features = ["derive"] }
+serde_spanned = { workspace = true }
+socket2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+toml_edit = { workspace = true, features = ["serde"] }
+tracing = { workspace = true }
+which = { workspace = true }
+cargo_xrun_client_win = { package = "cargo_xrun_client", path = "client", artifact = "bin", target = "i686-pc-windows-gnullvm" }
+# cargo_xrun_client_linux_x86_64 = { package = "cargo_xrun_client", path = "client", artifact = "bin", target = "x86_64-unknown-linux-musl" }
+
+[dev-dependencies]
+test-log = { workspace = true, features = ["trace"] }
+
+[workspace]
+members = ["client"]
+
+[workspace.dependencies]
 anyhow = "1.0.100"
 cargo-options = "0.7.6"
-clap = { version = "4.5.51", features = ["derive", "env", "wrap_help", "unstable-styles"] }
+clap = "4.5.51"
 clap-cargo = "0.18.3"
 dav-server = "0.8.0"
 dirs = "6.0.0"
 headers = "0.4.1"
-hyper = { version = "1.8.0", features = ["server", "http1"] }
-hyper-util = { version = "0.1.18", features = ["tokio"] }
+hyper = "1.8.0"
+hyper-util = "0.1.18"
 inquire = "0.9"
 rand = "0.9.2"
 relative-path = "2.0.1"
-send_ctrlc = { version = "0.6.0", features = ["tokio"] }
-serde = { version = "1.0.228", features = ["derive"] }
+send_ctrlc = "0.6.0"
+serde = "1.0.228"
 serde_spanned = "1.0"
 socket2 = "0.6.1"
 tempfile = "3.23.0"
-tokio = { version = "1.48.0", features = ["full"] }
-toml_edit = { version = "0.23.7", features = ["serde"] }
+test-log = "0.2.18"
+tokio = "1.48.0"
+toml_edit = "0.23.7"
 tracing = "0.1.41"
 which = "8.0.0"
-
-[dev-dependencies]
-test-log = { version = "0.2.18", features = ["trace"] }
