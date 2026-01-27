@@ -1,0 +1,5 @@
+[unstable]
+bindeps = true
+
+[target.i686-pc-windows-gnullvm]
+rustflags = ["-C", "linker=.cargo/zigcc"]

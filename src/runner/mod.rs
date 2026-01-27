@@ -61,12 +61,20 @@ pub async fn runner(
         .arg(ssh_ctrl_path)
         .args(["-o", "PreferredAuthentications=none"]) // force to use control path
         .arg(ssh_destination)
-        .arg("cmd")
-        .arg("/c");
+        .arg("powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-Command");
+
+    // Set remote working directory
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let remote_cwd = to_remote_path(cwd.as_os_str())?;
+    // command.arg("cd");
+    // command.arg(&remote_cwd);
+    // command.arg("&&");
 
     for (env_name, env_value) in envs {
-        command.arg("set");
-        command.arg(format!("{}={}", env_name, env_value));
+        command.arg(format!("$env:{}='{}'", env_name, env_value));
         command.arg("&&");
     }
 
