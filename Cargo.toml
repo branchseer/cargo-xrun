@@ -5,11 +5,11 @@ edition = "2024"
 
 [[bin]]
 name = "cargo-xrun"
-path = "src/xrun.rs"
+path = "src/main.rs"
 
 [[bin]]
 name = "cargo-xtest"
-path = "src/xtest.rs"
+path = "src/main.rs"
 
 [workspace]
 members = ["crates/remote", "crates/remote-i686-pc-windows-gnullvm", "crates/remote-x86_64-unknown-linux-musl", "crates/remote-aarch64-unknown-linux-musl"]
