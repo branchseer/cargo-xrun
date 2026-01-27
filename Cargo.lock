@@ -128,7 +128,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cargo-options",
- "cargo-xrun-remote",
+ "cargo-xrun-remote-aarch64-unknown-linux-musl",
+ "cargo-xrun-remote-i686-pc-windows-gnullvm",
+ "cargo-xrun-remote-x86_64-unknown-linux-musl",
  "clap",
  "clap-cargo",
  "dav-server",
@@ -153,6 +155,27 @@ dependencies = [
 [[package]]
 name = "cargo-xrun-remote"
 version = "0.1.0"
+
+[[package]]
+name = "cargo-xrun-remote-aarch64-unknown-linux-musl"
+version = "0.1.0"
+dependencies = [
+ "cargo-xrun-remote",
+]
+
+[[package]]
+name = "cargo-xrun-remote-i686-pc-windows-gnullvm"
+version = "0.1.0"
+dependencies = [
+ "cargo-xrun-remote",
+]
+
+[[package]]
+name = "cargo-xrun-remote-x86_64-unknown-linux-musl"
+version = "0.1.0"
+dependencies = [
+ "cargo-xrun-remote",
+]
 
 [[package]]
 name = "cfg-if"

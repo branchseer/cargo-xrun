@@ -1,0 +1,7 @@
+[package]
+name = "cargo-xrun-remote-x86_64-unknown-linux-musl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cargo-xrun-remote = { path = "../remote" }
