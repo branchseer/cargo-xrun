@@ -1,2 +1,0 @@
-#!/bin/sh
-exec cargo-zigbuild zig cc -- -g -fno-sanitize=all -target x86-windows-gnu "$@"

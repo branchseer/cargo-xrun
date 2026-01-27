@@ -2,4 +2,4 @@
 bindeps = true
 
 [target.i686-pc-windows-gnullvm]
-rustflags = ["-C", "linker=.cargo/zigcc"]
+rustflags = ["-C", "linker=.cargo/zigcc-win32"]
