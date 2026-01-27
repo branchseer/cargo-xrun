@@ -4,7 +4,7 @@ use std::{fmt::Display, fs::File, io::{Read as _, Seek as _, SeekFrom, Write as 
 
 use anyhow::Context as _;
 use config_file::{upsert_with, Host, UserResponse};
-use inquire::{InquireError, Select, Text, error::InquireResult};
+use inquire::{InquireError, Select, Text, error::InquireResult, validator::Validation};
 
 fn prompt_for_host_selection(
     existing_hosts: &[config_file::Host],
@@ -15,6 +15,13 @@ fn prompt_for_host_selection(
         println!("No remote hosts configured for {} yet.", target);
         let destination = Text::new("Enter SSH destination:")
             .with_placeholder("user@server.com")
+            .with_validator(|input: &str| {
+                if input.trim().is_empty() {
+                    Ok(Validation::Invalid("Destination cannot be empty".into()))
+                } else {
+                    Ok(Validation::Valid)
+                }
+            })
             .prompt()?;
         return Ok(UserResponse::AddNewHost { destination });
     }
@@ -58,6 +65,13 @@ fn prompt_for_host_selection(
         SelectOption::AddNewHost => {
             let destination = Text::new("Enter SSH destination:")
                 .with_placeholder("e.g., user@server.com")
+                .with_validator(|input: &str| {
+                    if input.trim().is_empty() {
+                        Ok(Validation::Invalid("Destination cannot be empty".into()))
+                    } else {
+                        Ok(Validation::Valid)
+                    }
+                })
                 .prompt()?;
             Ok(UserResponse::AddNewHost { destination })
         }
@@ -73,22 +87,22 @@ pub fn get_ssh_destination(target: &str) -> anyhow::Result<String> {
         .join("cargo-xrun");
     std::fs::create_dir_all(&config_dir)?;
 
-    let config_path = config_dir.join("config.toml");
+    let config_path = config_dir.join("config.json");
 
     // Create or open config file
-    let mut toml_config_file = File::options()
+    let mut json_config_file = File::options()
         .read(true)
         .write(true)
         .create(true)
         .open(&config_path)
         .with_context(|| format!("Failed to open or create config file at {:?}", &config_path))?;
 
-    let mut toml_config_str = String::new();
-    toml_config_file
-        .read_to_string(&mut toml_config_str)
+    let mut json_config_str = String::new();
+    json_config_file
+        .read_to_string(&mut json_config_str)
         .context(format!("Failed to read config file at {:?}", &config_path))?;
 
-    let host = upsert_with(&mut toml_config_str, target, |existing_hosts| {
+    let host = upsert_with(&mut json_config_str, target, |existing_hosts| {
         match prompt_for_host_selection(existing_hosts, target) {
             Ok(user_response) => Ok(user_response),
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
@@ -98,9 +112,9 @@ pub fn get_ssh_destination(target: &str) -> anyhow::Result<String> {
         }
     })?;
 
-    toml_config_file.set_len(0)?;
-    toml_config_file.seek(SeekFrom::Start(0))?;
-    toml_config_file.write_all(toml_config_str.as_bytes())?;
+    json_config_file.set_len(0)?;
+    json_config_file.seek(SeekFrom::Start(0))?;
+    json_config_file.write_all(json_config_str.as_bytes())?;
 
     Ok(host.destination)
 }
