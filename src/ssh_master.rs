@@ -40,6 +40,13 @@ impl SshMaster {
             .arg(control_path.as_file().as_os_str())
             .arg(ssh_destination)
             .arg("sc start WebClient >nul 2>nul & pause >nul 2>nul")
+            // Must explicitly configure stdin to prevent inheriting a piped stdin from the parent.
+            // If SSH inherits piped stdin, the Windows `pause` command fails with
+            // "Input redirection is not supported", causing the SSH session to exit immediately
+            // before the control socket can be created. With Stdio::piped(), the stdin is closed
+            // immediately (since we never take() it), causing `pause` to receive EOF and exit
+            // cleanly, keeping the SSH connection alive.
+            .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn_interruptible()
             .context("Failed to spawn ssh master daemon")?;
