@@ -3,4 +3,11 @@ name = "cargo-xrun-remote"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+encode = []
+decode = []
+
 [dependencies]
+wincode = { version = "0.2.5", features = ["derive"] }
+base64 = "0.22"

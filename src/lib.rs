@@ -1,4 +1,5 @@
 mod config;
+mod embedded_binaries;
 mod fs_server;
 mod runner;
 mod ssh_master;

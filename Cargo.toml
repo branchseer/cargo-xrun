@@ -12,16 +12,19 @@ name = "cargo-xtest"
 path = "src/main.rs"
 
 [workspace]
-members = ["crates/remote", "crates/remote-i686-pc-windows-gnullvm", "crates/remote-x86_64-unknown-linux-musl", "crates/remote-aarch64-unknown-linux-musl"]
+members = ["crates/*"]
 
 [dependencies]
 anyhow = "1.0.100"
+bytes = "1"
+futures-util = "0.3"
 cargo-options = "0.7.6"
 clap = { version = "4.5.51", features = ["derive", "env", "wrap_help", "unstable-styles"] }
 clap-cargo = "0.18.3"
 dav-server = "0.8.0"
 dirs = "6.0.0"
 headers = "0.4.1"
+http-body-util = "0.1"
 hyper = { version = "1.8.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.18", features = ["tokio"] }
 inquire = { version = "0.9", default-features = false, features = ["console"] }
@@ -35,6 +38,7 @@ tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["full"] }
 tracing = "0.1.41"
 which = "8.0.0"
+cargo-xrun-remote = { path = "crates/remote", features = ["encode"] }
 cargo-xrun-remote-i686-pc-windows-gnullvm = { path = "crates/remote-i686-pc-windows-gnullvm", artifact = "bin", target = "i686-pc-windows-gnullvm" }
 cargo-xrun-remote-x86_64-unknown-linux-musl = { path = "crates/remote-x86_64-unknown-linux-musl", artifact = "bin", target = "x86_64-unknown-linux-musl" }
 cargo-xrun-remote-aarch64-unknown-linux-musl = { path = "crates/remote-aarch64-unknown-linux-musl", artifact = "bin", target = "aarch64-unknown-linux-musl" }

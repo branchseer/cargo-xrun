@@ -1,0 +1,6 @@
+pub const WINDOWS_I686: &[u8] =
+    include_bytes!(env!("CARGO_BIN_FILE_CARGO_XRUN_REMOTE_I686_PC_WINDOWS_GNULLVM"));
+pub const LINUX_X86_64: &[u8] =
+    include_bytes!(env!("CARGO_BIN_FILE_CARGO_XRUN_REMOTE_X86_64_UNKNOWN_LINUX_MUSL"));
+pub const LINUX_AARCH64: &[u8] =
+    include_bytes!(env!("CARGO_BIN_FILE_CARGO_XRUN_REMOTE_AARCH64_UNKNOWN_LINUX_MUSL"));

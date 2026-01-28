@@ -1,5 +1,4 @@
 use std::{
-    any,
     mem::ManuallyDrop,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
