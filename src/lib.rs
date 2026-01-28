@@ -4,6 +4,7 @@ mod fs_server;
 mod runner;
 mod ssh_master;
 
+use anyhow::Context;
 use ssh_master::SshMaster;
 use std::{
     env::{self, args_os, current_exe},
@@ -13,7 +14,7 @@ use std::{
 };
 use tokio::process::Command;
 
-use clap::Parser;
+use clap::{Parser, builder::Str};
 use which::which;
 
 #[derive(Debug, Parser)]
@@ -30,6 +31,11 @@ enum Opt {
         /// Build and run for the target triple
         #[clap(name = "target", long, required = true)]
         triple: String,
+
+        ///Command for building, defaulting to 'cargo'. Possible values include: 'cargo', 'cargo-zigbuild', and 'cargo-xwin'.
+        #[clap(name = "builder", long)]
+        builder: Option<String>,
+
         /// Arguments for `cargo run`. Check `cargo help run` for details.
         #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
         cargo_run_args: Vec<OsString>,
@@ -39,6 +45,11 @@ enum Opt {
         /// Build and run for the target triple
         #[clap(name = "target", long, required = true)]
         triple: String,
+
+        ///Command for building, defaulting to 'cargo'. Possible values include: 'cargo', 'cargo-zigbuild', and 'cargo-xwin'.
+        #[clap(name = "builder", long)]
+        builder: Option<String>,
+
         /// Arguments for `cargo test`. Check `cargo help test` for details.
         #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
         cargo_test_args: Vec<OsString>,
@@ -46,19 +57,17 @@ enum Opt {
 }
 
 async fn exec_cargo(
-    alt_cargo: Option<&str>,
+    builder: Option<String>,
     subcommand: &str,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     envs: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
 ) -> anyhow::Result<ExitStatus> {
-    let alt_cargo_path = alt_cargo
-        .and_then(|cmd| which(cmd).ok())
-        .map(PathBuf::into_os_string);
+    let builder = builder.unwrap_or_else(|| env::var("CARGO").unwrap_or("cargo".into()));
+    let cargo_path =
+        which(&builder).with_context(|| format!("Failed to find executable {}", builder))?;
 
     // https://github.com/rust-cross/cargo-zigbuild/blob/75aca8d5f0230a4cf3f116a0b6ab24c7b6124926/src/bin/cargo-zigbuild.rs#L92
-    let mut cargo_command = Command::new(
-        alt_cargo_path.unwrap_or_else(|| env::var_os("CARGO").unwrap_or("cargo".into())),
-    );
+    let mut cargo_command = Command::new(cargo_path);
     cargo_command
         .arg(subcommand)
         .args(args)
@@ -117,15 +126,17 @@ pub async fn cli_main() -> anyhow::Result<ExitCode> {
 
     let opt = Opt::parse();
 
-    let (cargo_subcommand, triple, args) = match opt {
+    let (cargo_subcommand, triple, builder, args) = match opt {
         Opt::XRun {
             triple,
+            builder,
             cargo_run_args,
-        } => ("run", triple, cargo_run_args),
+        } => ("run", triple, builder, cargo_run_args),
         Opt::XTest {
             triple,
+            builder,
             cargo_test_args,
-        } => ("test", triple, cargo_test_args),
+        } => ("test", triple, builder, cargo_test_args),
     };
 
     let alt_cargo = if triple.contains("windows") {
@@ -164,7 +175,7 @@ pub async fn cli_main() -> anyhow::Result<ExitCode> {
     let ssh_master = SshMaster::start(&ssh_destination, dav_port).await?;
 
     let cargo_status = exec_cargo(
-        alt_cargo,
+        builder,
         cargo_subcommand,
         args,
         [
