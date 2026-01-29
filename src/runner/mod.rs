@@ -70,11 +70,17 @@ pub async fn runner(
         })
         .collect::<Result<_, _>>()?;
 
+    let webdav_path = format!(
+        "\\\\localhost@{}\\DavWWWRoot",
+        ssh_remote_fs_server_port
+    );
+
     let ctx = ExecContext {
         cwd: remote_cwd,
         envs,
         bin_path,
         args: args_vec,
+        webdav_path,
     };
     let encoded = encode_context(&ctx);
 
