@@ -1,7 +1,4 @@
-use std::{
-    ffi::OsStr,
-    process::ExitCode,
-};
+use std::{ffi::OsStr, process::ExitCode};
 
 use anyhow::Context as _;
 use cargo_xrun_remote::{ExecContext, encode::encode_context};

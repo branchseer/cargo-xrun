@@ -1,3 +1,3 @@
-fn main() {
-    cargo_xrun_remote::main();
+fn main() -> std::process::ExitCode {
+    cargo_xrun_remote::main()
 }

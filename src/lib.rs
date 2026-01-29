@@ -9,7 +9,6 @@ use ssh_master::SshMaster;
 use std::{
     env::{self, args_os, current_exe},
     ffi::{OsStr, OsString},
-    path::PathBuf,
     process::{ExitCode, ExitStatus},
 };
 use tokio::process::Command;
