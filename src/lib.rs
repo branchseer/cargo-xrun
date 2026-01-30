@@ -23,8 +23,8 @@ use which::which;
 /// then combine them with `--` inserted if the latter is non-empty.
 #[derive(Debug, Parser)]
 struct TrailingArgs {
-    /// Arguments before `--`
-    #[clap(allow_hyphen_values = true)]
+    /// Extra arguments passed to `cargo run`/`cargo test`. Use `--` to separate arguments for the target binary.
+    #[clap(allow_hyphen_values = true, value_name = "ARGS")]
     before_separator: Vec<OsString>,
 
     /// Arguments after `--` (hidden since this is an implementation detail)
@@ -65,6 +65,7 @@ enum Opt {
         #[clap(flatten)]
         trailing_args: TrailingArgs,
     },
+    /// Run tests of the local package remotely
     #[command(name = "xtest", aliases = ["test", "t"])]
     XTest {
         /// Build and run for the target triple
@@ -162,8 +163,6 @@ pub async fn cli_main() -> anyhow::Result<ExitCode> {
             trailing_args,
         } => ("test", triple, builder, trailing_args.into_args()),
     };
-
-    dbg!(&args);
 
     let args = [OsStr::new("--target"), OsStr::new(&triple)]
         .into_iter()
