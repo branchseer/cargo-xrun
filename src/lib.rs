@@ -13,8 +13,35 @@ use std::{
 };
 use tokio::process::Command;
 
-use clap::{Parser, builder::Str};
+use clap::Parser;
 use which::which;
+
+/// Captures trailing arguments while preserving `--` separator.
+///
+/// Clap normally consumes `--` as a delimiter without including it in captured args.
+/// To preserve `--` when present, we capture args before and after `--` separately,
+/// then combine them with `--` inserted if the latter is non-empty.
+#[derive(Debug, Parser)]
+struct TrailingArgs {
+    /// Arguments before `--`
+    #[clap(allow_hyphen_values = true)]
+    before_separator: Vec<OsString>,
+
+    /// Arguments after `--` (hidden since this is an implementation detail)
+    #[clap(last = true, hide = true)]
+    after_separator: Vec<OsString>,
+}
+
+impl TrailingArgs {
+    fn into_args(self) -> Vec<OsString> {
+        let mut args = self.before_separator;
+        if !self.after_separator.is_empty() {
+            args.push("--".into());
+            args.extend(self.after_separator);
+        }
+        args
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,9 +62,8 @@ enum Opt {
         #[clap(name = "builder", long)]
         builder: Option<String>,
 
-        /// Arguments for `cargo run`. Check `cargo help run` for details.
-        #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
-        cargo_run_args: Vec<OsString>,
+        #[clap(flatten)]
+        trailing_args: TrailingArgs,
     },
     #[command(name = "xtest", aliases = ["test", "t"])]
     XTest {
@@ -49,9 +75,8 @@ enum Opt {
         #[clap(name = "builder", long)]
         builder: Option<String>,
 
-        /// Arguments for `cargo test`. Check `cargo help test` for details.
-        #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
-        cargo_test_args: Vec<OsString>,
+        #[clap(flatten)]
+        trailing_args: TrailingArgs,
     },
 }
 
@@ -129,22 +154,16 @@ pub async fn cli_main() -> anyhow::Result<ExitCode> {
         Opt::XRun {
             triple,
             builder,
-            cargo_run_args,
-        } => ("run", triple, builder, cargo_run_args),
+            trailing_args,
+        } => ("run", triple, builder, trailing_args.into_args()),
         Opt::XTest {
             triple,
             builder,
-            cargo_test_args,
-        } => ("test", triple, builder, cargo_test_args),
+            trailing_args,
+        } => ("test", triple, builder, trailing_args.into_args()),
     };
 
-    let alt_cargo = if triple.contains("windows") {
-        Some("cargo-xwin")
-    } else if triple.contains("linux") {
-        Some("cargo-zigbuild")
-    } else {
-        None
-    };
+    dbg!(&args);
 
     let args = [OsStr::new("--target"), OsStr::new(&triple)]
         .into_iter()
@@ -217,8 +236,73 @@ fn contains_space(s: impl AsRef<OsStr>) -> bool {
     })
 }
 
-#[test]
-fn test_contains_space() {
-    assert!(contains_space("hello world"));
-    assert!(!contains_space("helloworld"));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_contains_space() {
+        assert!(contains_space("hello world"));
+        assert!(!contains_space("helloworld"));
+    }
+
+    #[test]
+    fn test_xrun_without_separator() {
+        let opt =
+            Opt::parse_from(["cargo-xrun", "xrun", "--target", "aarch64-pc-windows-msvc", "foo"]);
+        match opt {
+            Opt::XRun { trailing_args, .. } => {
+                assert_eq!(trailing_args.into_args(), vec!["foo"]);
+            }
+            _ => panic!("expected XRun"),
+        }
+    }
+
+    #[test]
+    fn test_xrun_with_separator() {
+        let opt = Opt::parse_from([
+            "cargo-xrun",
+            "xrun",
+            "--target",
+            "aarch64-pc-windows-msvc",
+            "--",
+            "bar",
+        ]);
+        match opt {
+            Opt::XRun { trailing_args, .. } => {
+                assert_eq!(trailing_args.into_args(), vec!["--", "bar"]);
+            }
+            _ => panic!("expected XRun"),
+        }
+    }
+
+    #[test]
+    fn test_xrun_with_args_before_and_after_separator() {
+        let opt = Opt::parse_from([
+            "cargo-xrun",
+            "xrun",
+            "--target",
+            "aarch64-pc-windows-msvc",
+            "foo",
+            "--",
+            "bar",
+        ]);
+        match opt {
+            Opt::XRun { trailing_args, .. } => {
+                assert_eq!(trailing_args.into_args(), vec!["foo", "--", "bar"]);
+            }
+            _ => panic!("expected XRun"),
+        }
+    }
+
+    #[test]
+    fn test_xrun_no_trailing_args() {
+        let opt = Opt::parse_from(["cargo-xrun", "xrun", "--target", "aarch64-pc-windows-msvc"]);
+        match opt {
+            Opt::XRun { trailing_args, .. } => {
+                assert!(trailing_args.into_args().is_empty());
+            }
+            _ => panic!("expected XRun"),
+        }
+    }
 }
