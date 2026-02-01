@@ -11,4 +11,5 @@ fn main() {
     for arg in std::env::args_os() {
         println!("  {:?}", arg);
     }
+    std::process::exit(2)
 }
