@@ -43,7 +43,7 @@ pub async fn runner(
         {
             let env_value = to_remote_path(&env_value)?;
             envs.push((env_name, env_value));
-        } else if env_name.starts_with("CARGO_") {
+        } else if env_name.starts_with("CARGO_") || env_name.starts_with("INSTA_") {
             let env_value = env_value
                 .into_string()
                 .ok()
