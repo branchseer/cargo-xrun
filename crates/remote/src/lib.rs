@@ -123,34 +123,27 @@ pub fn main() -> std::process::ExitCode {
     #[cfg(not(windows))]
     let ctx = decode::decode_context(&args[1]).unwrap();
 
-    // On Windows, mount WebDAV path to drive letter
+    // On Windows, use UNC paths directly with extended-length prefix (\\?\UNC\)
+    // to avoid the 260-char path limit. No drive letter mapping (subst) needed —
+    // subst adds an indirection layer through MiniRdr that causes flaky
+    // ERROR_BAD_NETPATH under concurrent directory listing.
     #[cfg(windows)]
-    let _mount = {
-        // Mount the WebDAV root directly - no delay needed since UNC paths work immediately
-        match WebDavMount::mount(&ctx.webdav_path) {
-            Ok(mount) => {
-                // Transform all paths by replacing ALL occurrences of WebDAV prefix
-                ctx.cwd = mount.transform_path(&ctx.cwd);
-                ctx.bin_path = mount.transform_path(&ctx.bin_path);
-                ctx.envs = ctx.envs
-                    .into_iter()
-                    .map(|(k, v)| (k, mount.transform_path(&v)))
-                    .collect();
+    {
+        // Transform \\server\share paths to \\?\UNC\server\share for extended-length support
+        let unc_prefix = format!("\\\\?\\UNC\\{}", ctx.webdav_path.trim_start_matches("\\\\"));
+        let webdav_prefix_with_slash = format!("{}\\", ctx.webdav_path);
+        let unc_prefix_with_slash = format!("{}\\", unc_prefix);
+        let transform = |path: &str| -> String {
+            path.replace(&webdav_prefix_with_slash, &unc_prefix_with_slash)
+        };
+        ctx.cwd = transform(&ctx.cwd);
+        ctx.bin_path = transform(&ctx.bin_path);
+        ctx.envs = ctx.envs
+            .into_iter()
+            .map(|(k, v)| (k, transform(&v)))
+            .collect();
+    }
 
-                // Change to the transformed path (now using drive letter)
-                env::set_current_dir(&ctx.cwd).unwrap();
-
-                mount
-            }
-            Err(e) => {
-                use std::process::ExitCode;
-                eprintln!("cargo-xrun-remote: Failed to mount WebDAV drive: {}", e);
-                return ExitCode::from(1);
-            }
-        }
-    };
-
-    #[cfg(not(windows))]
     env::set_current_dir(&ctx.cwd).unwrap();
 
     let mut cmd = Command::new(&ctx.bin_path);
