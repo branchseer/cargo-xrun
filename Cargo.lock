@@ -182,13 +182,37 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "binrw"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f4b52fe7fbd9e207b879c52c5af7efd861c2f4e234ab4f744b0bdc04a863623"
+dependencies = [
+ "array-init",
+ "binrw_derive 0.14.2",
+ "bytemuck",
+]
+
+[[package]]
+name = "binrw"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d53195f985e88ab94d1cc87e80049dd2929fd39e4a772c5ae96a7e5c4aad3642"
 dependencies = [
  "array-init",
- "binrw_derive",
+ "binrw_derive 0.15.1",
  "bytemuck",
+]
+
+[[package]]
+name = "binrw_derive"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7196f6935a944081728167ce6e3a599bd38d6d80d21afe4ca17be2097a6682f"
+dependencies = [
+ "either",
+ "owo-colors 3.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -198,7 +222,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5910da05ee556b789032c8ff5a61fb99239580aa3fd0bfaa8f4d094b2aee00ad"
 dependencies = [
  "either",
- "owo-colors",
+ "owo-colors 4.3.0",
  "proc-macro2",
  "quote",
  "syn 2.0.110",
@@ -1697,6 +1721,12 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "owo-colors"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
+
+[[package]]
+name = "owo-colors"
 version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
@@ -2657,7 +2687,7 @@ dependencies = [
  "aead",
  "aes",
  "aes-gcm",
- "binrw",
+ "binrw 0.15.1",
  "ccm",
  "cmac",
  "crypto-common 0.2.0-rc.4",
@@ -2692,7 +2722,7 @@ version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11e11570063587382275297db37dd686360fcc109d22a8d655846dc93bf4a71a"
 dependencies = [
- "binrw",
+ "binrw 0.15.1",
  "modular-bitfield",
  "pastey",
  "rand 0.8.6",
@@ -2717,7 +2747,7 @@ version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07ff4559d37f9c3e6b56fffa1a359a6f151337b18b9d0218161488a4a7e15685"
 dependencies = [
- "binrw",
+ "binrw 0.15.1",
  "modular-bitfield",
  "pastey",
  "smb-dtyp",
@@ -2731,7 +2761,7 @@ version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87b761115473b9af471c06b28e1d26b16602c97ae315c8d325b2418dedb992bf"
 dependencies = [
- "binrw",
+ "binrw 0.15.1",
  "modular-bitfield",
  "pastey",
  "smb-dtyp",
@@ -2758,7 +2788,7 @@ version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "352732178153ef2379552a09cd5319fc4ce49a0837576e87eb9ac36652330a46"
 dependencies = [
- "binrw",
+ "binrw 0.15.1",
  "maybe-async",
  "modular-bitfield",
  "pastey",
@@ -2773,7 +2803,7 @@ version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "383209d094590c95b748cf20e79e5216ec8cf458486c0253c3610dd2c36d435d"
 dependencies = [
- "binrw",
+ "binrw 0.15.1",
  "futures-core",
  "futures-util",
  "log",
@@ -2791,6 +2821,7 @@ dependencies = [
 name = "smbserver"
 version = "0.1.0"
 dependencies = [
+ "binrw 0.14.2",
  "futures-core",
  "futures-util",
  "smb",
