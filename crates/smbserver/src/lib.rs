@@ -17,7 +17,8 @@ use wire::echo::{EchoRequest, EchoResponse};
 use wire::error::ErrorResponse;
 use wire::flush::{FlushRequest, FlushResponse};
 use wire::fscc::{
-    FileBasicInformation, FileBothDirectoryInformation, FileNetworkOpenInformation,
+    FileBasicInformation, FileBothDirectoryInformation, FileDispositionInformation,
+    FileEndOfFileInformation, FileNetworkOpenInformation, FileRenameInformation,
     FileStandardInformation,
 };
 use wire::header::Header;
@@ -25,6 +26,7 @@ use wire::logoff::{LogoffRequest, LogoffResponse};
 use wire::negotiate::{NegotiateRequest, NegotiateResponse};
 use wire::query_directory::{QueryDirectoryRequest, QueryDirectoryResponse};
 use wire::query_info::{QueryInfoRequest, QueryInfoResponse};
+use wire::set_info::{SetInfoRequest, SetInfoResponse};
 use wire::read::{ReadRequest, ReadResponse};
 use wire::session_setup::{SessionSetupRequest, SessionSetupResponse};
 use wire::tree_connect::{TreeConnectRequest, TreeConnectResponse};
@@ -45,6 +47,7 @@ const COMMAND_WRITE: u16 = 0x0009;
 const COMMAND_ECHO: u16 = 0x000D;
 const COMMAND_QUERY_DIRECTORY: u16 = 0x000E;
 const COMMAND_QUERY_INFO: u16 = 0x0010;
+const COMMAND_SET_INFO: u16 = 0x0011;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -81,6 +84,10 @@ const INFO_TYPE_FILE: u8 = 0x01;
 const FILE_INFO_BASIC: u8 = 4;
 const FILE_INFO_STANDARD: u8 = 5;
 const FILE_INFO_NETWORK_OPEN: u8 = 34;
+/// FileInformationClass values used by SET_INFO. MS-FSCC §2.4.
+const FILE_INFO_RENAME: u8 = 10;
+const FILE_INFO_DISPOSITION: u8 = 13;
+const FILE_INFO_END_OF_FILE: u8 = 20;
 const DIALECT_SMB_2_1: u16 = 0x0210;
 /// First session id we hand out. SMB session ids must be non-zero.
 const FIRST_SESSION_ID: u64 = 0x1000_0000_0000_0001;
@@ -318,9 +325,17 @@ fn decode_utf16le(bytes: &[u8]) -> Result<String, std::string::FromUtf16Error> {
 
 /// Per-TCP-connection state. Holds the file handle table and any other
 /// state that lasts for the lifetime of one accepted socket.
+struct OpenFile {
+    handle: Arc<dyn FileHandle>,
+    /// Path passed to the original CREATE — needed for rename and delete.
+    path: String,
+    /// Set by SET_INFO FileDispositionInformation; acted on at CLOSE.
+    delete_on_close: bool,
+}
+
 struct ConnectionState {
     inner: Arc<Inner>,
-    open_files: HashMap<u64, Arc<dyn FileHandle>>,
+    open_files: HashMap<u64, OpenFile>,
     next_file_id: u64,
     /// FileIds whose directory listing has been fully delivered. Cleared
     /// when the client sends QUERY_DIRECTORY with the RESTART_SCANS flag.
@@ -365,8 +380,91 @@ impl ConnectionState {
             COMMAND_FLUSH => Some(self.handle_flush(request_header, &mut cursor)),
             COMMAND_ECHO => Some(self.handle_echo(request_header, &mut cursor)),
             COMMAND_QUERY_INFO => Some(self.handle_query_info(request_header, &mut cursor)),
+            COMMAND_SET_INFO => Some(self.handle_set_info(request_header, &mut cursor)),
             _ => None,
         }
+    }
+
+    fn handle_set_info(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+        let request = match SetInfoRequest::read(cursor) {
+            Ok(r) => r,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        if request.info_type != INFO_TYPE_FILE {
+            return self.error_response(request_header, STATUS_INVALID_INFO_CLASS);
+        }
+
+        let result = match request.file_info_class {
+            FILE_INFO_END_OF_FILE => {
+                let info = match FileEndOfFileInformation::read(&mut Cursor::new(&request.buffer))
+                {
+                    Ok(i) => i,
+                    Err(_) => {
+                        return self.error_response(request_header, STATUS_INVALID_PARAMETER);
+                    }
+                };
+                let entry = match self.open_files.get(&request.file_id_volatile) {
+                    Some(of) => of,
+                    None => return self.error_response(request_header, STATUS_FILE_CLOSED),
+                };
+                entry.handle.truncate(info.end_of_file)
+            }
+            FILE_INFO_DISPOSITION => {
+                let info = match FileDispositionInformation::read(&mut Cursor::new(
+                    &request.buffer,
+                )) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        return self.error_response(request_header, STATUS_INVALID_PARAMETER);
+                    }
+                };
+                let entry = match self.open_files.get_mut(&request.file_id_volatile) {
+                    Some(of) => of,
+                    None => return self.error_response(request_header, STATUS_FILE_CLOSED),
+                };
+                entry.delete_on_close = info.delete_pending != 0;
+                Ok(())
+            }
+            FILE_INFO_RENAME => {
+                let info = match FileRenameInformation::read(&mut Cursor::new(&request.buffer)) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        return self.error_response(request_header, STATUS_INVALID_PARAMETER);
+                    }
+                };
+                let new_path = match decode_utf16le(&info.file_name) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return self.error_response(request_header, STATUS_INVALID_PARAMETER);
+                    }
+                };
+                let old_path = match self.open_files.get(&request.file_id_volatile) {
+                    Some(of) => of.path.clone(),
+                    None => return self.error_response(request_header, STATUS_FILE_CLOSED),
+                };
+                let fs = match self.trees.get(&request_header.tree_id) {
+                    Some(fs) => fs.clone(),
+                    None => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+                };
+                let r = fs.rename(&old_path, &new_path);
+                if r.is_ok() {
+                    if let Some(of) = self.open_files.get_mut(&request.file_id_volatile) {
+                        of.path = new_path;
+                    }
+                }
+                r
+            }
+            _ => return self.error_response(request_header, STATUS_INVALID_INFO_CLASS),
+        };
+
+        if let Err(e) = result {
+            return self.error_response(request_header, map_io_err(e));
+        }
+
+        let response_header = self.simple_response_header(&request_header, COMMAND_SET_INFO);
+        let response_body = SetInfoResponse { structure_size: 2 };
+        write_response(response_header, response_body, 0)
     }
 
     fn handle_query_info(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
@@ -376,7 +474,7 @@ impl ConnectionState {
         };
 
         let handle = match self.open_files.get(&request.file_id_volatile) {
-            Some(h) => h.clone(),
+            Some(of) => of.handle.clone(),
             None => return self.error_response(request_header, STATUS_FILE_CLOSED),
         };
 
@@ -502,7 +600,7 @@ impl ConnectionState {
         };
 
         let handle = match self.open_files.get(&request.file_id_volatile) {
-            Some(h) => h.clone(),
+            Some(of) => of.handle.clone(),
             None => return self.error_response(request_header, STATUS_FILE_CLOSED),
         };
 
@@ -569,7 +667,7 @@ impl ConnectionState {
         };
 
         let handle = match self.open_files.get(&request.file_id_volatile) {
-            Some(h) => h.clone(),
+            Some(of) => of.handle.clone(),
             None => return self.error_response(request_header, STATUS_FILE_CLOSED),
         };
 
@@ -627,7 +725,7 @@ impl ConnectionState {
         };
 
         let handle = match self.open_files.get(&request.file_id_volatile) {
-            Some(h) => h.clone(),
+            Some(of) => of.handle.clone(),
             None => return self.error_response(request_header, STATUS_FILE_CLOSED),
         };
 
@@ -680,10 +778,21 @@ impl ConnectionState {
             Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
         };
 
-        // Pull the handle out (drop completes when nothing else holds it).
-        let handle = self.open_files.remove(&request.file_id_volatile);
+        // Pull the handle out, snapshot whatever we need from it before
+        // dropping (so the FS sees no live handle when delete runs).
+        let entry = self.open_files.remove(&request.file_id_volatile);
         self.listed_dirs.remove(&request.file_id_volatile);
-        let size = handle.as_ref().map(|h| h.size()).unwrap_or(0);
+        let size = entry.as_ref().map(|e| e.handle.size()).unwrap_or(0);
+        let to_delete = entry
+            .as_ref()
+            .filter(|e| e.delete_on_close)
+            .map(|e| e.path.clone());
+        drop(entry);
+        if let Some(path) = to_delete
+            && let Some(fs) = self.trees.get(&request_header.tree_id)
+        {
+            let _ = fs.delete(&path);
+        }
 
         let response_header = Header {
             structure_size: 64,
@@ -754,7 +863,14 @@ impl ConnectionState {
         } else {
             FILE_ATTRIBUTE_NORMAL
         };
-        self.open_files.insert(file_id, handle);
+        self.open_files.insert(
+            file_id,
+            OpenFile {
+                handle,
+                path: path.clone(),
+                delete_on_close: false,
+            },
+        );
 
         let response_header = Header {
             structure_size: 64,

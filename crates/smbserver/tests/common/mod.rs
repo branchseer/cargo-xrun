@@ -180,6 +180,36 @@ impl smbserver::Filesystem for InMemoryFs {
         entry.lock().unwrap().clear();
         Ok(std::sync::Arc::new(MemFile { data: entry.clone() }))
     }
+
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        let mut files = self.files.lock().unwrap();
+        let data = files.remove(from).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("no such file: {from}"))
+        })?;
+        if files.contains_key(to) {
+            // Restore source so the rename is atomic from the FS's POV.
+            files.insert(from.to_string(), data);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("destination exists: {to}"),
+            ));
+        }
+        files.insert(to.to_string(), data);
+        Ok(())
+    }
+
+    fn delete(&self, path: &str) -> std::io::Result<()> {
+        let mut files = self.files.lock().unwrap();
+        files
+            .remove(path)
+            .map(|_| ())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no such file: {path}"),
+                )
+            })
+    }
 }
 
 impl InMemoryFs {
@@ -273,6 +303,12 @@ impl smbserver::FileHandle for MemFile {
         }
         data[start..end].copy_from_slice(payload);
         Ok(payload.len() as u32)
+    }
+
+    fn truncate(&self, size: u64) -> std::io::Result<()> {
+        let mut data = self.data.lock().unwrap();
+        data.resize(size as usize, 0);
+        Ok(())
     }
 }
 

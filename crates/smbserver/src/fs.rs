@@ -23,6 +23,22 @@ pub trait Filesystem: Send + Sync + 'static {
             "Filesystem is read-only",
         ))
     }
+
+    /// Rename `from` to `to`. Default rejects with `Unsupported`.
+    fn rename(&self, _from: &str, _to: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem does not support rename",
+        ))
+    }
+
+    /// Delete the file at `path`. Default rejects with `Unsupported`.
+    fn delete(&self, _path: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem does not support delete",
+        ))
+    }
 }
 
 pub trait FileHandle: Send + Sync {
@@ -74,6 +90,16 @@ pub trait FileHandle: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "FileHandle is not a directory",
+        ))
+    }
+
+    /// Truncate or extend the file to exactly `size` bytes. Called in
+    /// response to SET_INFO with FileEndOfFileInformation. Extending
+    /// zero-fills. Default: rejected.
+    fn truncate(&self, _size: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "FileHandle does not support truncate",
         ))
     }
 }
