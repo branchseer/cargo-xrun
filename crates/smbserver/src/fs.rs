@@ -16,22 +16,47 @@ pub trait Filesystem: Send + Sync + 'static {
 
 pub trait FileHandle: Send + Sync {
     /// Total file size in bytes — used to populate the CREATE Response
-    /// `end_of_file` field and to bound READs.
+    /// `end_of_file` field and to bound READs. Directories report 0.
     fn size(&self) -> u64;
+
+    /// True for directory handles. Default false (file).
+    fn is_directory(&self) -> bool {
+        false
+    }
 
     /// Read up to `len` bytes starting at `offset`. Returns fewer bytes
     /// than requested only at end-of-file.
-    fn read(&self, offset: u64, len: u32) -> io::Result<Vec<u8>>;
+    fn read(&self, _offset: u64, _len: u32) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "FileHandle does not support reads",
+        ))
+    }
 
     /// Write `data` at `offset`, extending the file as needed. Returns
     /// the number of bytes accepted (typically `data.len()`).
-    ///
-    /// Default impl rejects all writes with `ErrorKind::Unsupported`,
-    /// matching the read-only default of pre-existing handles.
     fn write(&self, _offset: u64, _data: &[u8]) -> io::Result<u32> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "FileHandle is read-only",
         ))
     }
+
+    /// List the immediate children of this directory handle. Called
+    /// in response to QUERY_DIRECTORY. Default: not a directory.
+    fn list_children(&self) -> io::Result<Vec<DirEntry>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "FileHandle is not a directory",
+        ))
+    }
+}
+
+/// One entry returned by `FileHandle::list_children`. The server marshals
+/// these into FILE_BOTH_DIR_INFORMATION records on the wire.
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
 }

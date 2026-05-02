@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -9,13 +9,15 @@ pub mod fs;
 pub mod ntlmssp;
 pub mod wire;
 
-pub use fs::{FileHandle, Filesystem};
+pub use fs::{DirEntry, FileHandle, Filesystem};
 
 use wire::close::{CloseRequest, CloseResponse};
 use wire::create::{CreateRequest, CreateResponse};
 use wire::error::ErrorResponse;
+use wire::fscc::FileBothDirectoryInformation;
 use wire::header::Header;
 use wire::negotiate::{NegotiateRequest, NegotiateResponse};
+use wire::query_directory::{QueryDirectoryRequest, QueryDirectoryResponse};
 use wire::read::{ReadRequest, ReadResponse};
 use wire::session_setup::{SessionSetupRequest, SessionSetupResponse};
 use wire::tree_connect::{TreeConnectRequest, TreeConnectResponse};
@@ -29,6 +31,7 @@ const COMMAND_CREATE: u16 = 0x0005;
 const COMMAND_CLOSE: u16 = 0x0006;
 const COMMAND_READ: u16 = 0x0008;
 const COMMAND_WRITE: u16 = 0x0009;
+const COMMAND_QUERY_DIRECTORY: u16 = 0x000E;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -36,6 +39,11 @@ const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_FILE_CLOSED: u32 = 0xC000_0128;
 const STATUS_END_OF_FILE: u32 = 0xC000_0011;
+const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
+/// File attribute: directory. MS-FSCC §2.6.
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+/// QUERY_DIRECTORY request flag.
+const QUERY_DIR_FLAG_RESTART_SCANS: u8 = 0x01;
 /// File attribute: regular file. MS-FSCC §2.6.
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 /// CREATE Action: existing file was opened. MS-SMB2 §2.2.14.
@@ -108,6 +116,60 @@ impl ServerBuilder {
     }
 }
 
+/// Marshal a list of `DirEntry` as a chain of FILE_BOTH_DIR_INFORMATION
+/// records, each padded to an 8-byte boundary, with `next_entry_offset`
+/// patched to the byte distance to the next entry (0 for the last).
+fn marshal_dir_entries(entries: &[DirEntry]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut entry_starts = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        entry_starts.push(buf.len());
+        let name_bytes: Vec<u8> = entry
+            .name
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let info = FileBothDirectoryInformation {
+            next_entry_offset: 0,
+            file_index: 0,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            end_of_file: entry.size,
+            allocation_size: entry.size,
+            file_attributes: if entry.is_dir {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_NORMAL
+            },
+            ea_size: 0,
+            short_name_length: 0,
+            reserved: 0,
+            short_name: [0; 24],
+            file_name: name_bytes,
+        };
+        let mut record = Vec::new();
+        info.write(&mut Cursor::new(&mut record))
+            .expect("FileBothDirectoryInformation serialize cannot fail");
+        buf.extend_from_slice(&record);
+        // Pad to 8-byte boundary between entries.
+        while buf.len() % 8 != 0 {
+            buf.push(0);
+        }
+    }
+
+    // Patch next_entry_offset on every entry except the last.
+    for i in 0..entry_starts.len().saturating_sub(1) {
+        let here = entry_starts[i];
+        let next = entry_starts[i + 1];
+        let delta = (next - here) as u32;
+        buf[here..here + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+    buf
+}
+
 /// Decode a UTF-16LE byte buffer (as carried in SMB2 name fields) to UTF-8.
 fn decode_utf16le(bytes: &[u8]) -> Result<String, std::string::FromUtf16Error> {
     let units: Vec<u16> = bytes
@@ -123,6 +185,9 @@ struct ConnectionState {
     inner: Arc<Inner>,
     open_files: HashMap<u64, Arc<dyn FileHandle>>,
     next_file_id: u64,
+    /// FileIds whose directory listing has been fully delivered. Cleared
+    /// when the client sends QUERY_DIRECTORY with the RESTART_SCANS flag.
+    listed_dirs: HashSet<u64>,
 }
 
 impl ConnectionState {
@@ -131,6 +196,7 @@ impl ConnectionState {
             inner,
             open_files: HashMap::new(),
             next_file_id: 1,
+            listed_dirs: HashSet::new(),
         }
     }
 
@@ -146,8 +212,82 @@ impl ConnectionState {
             COMMAND_CLOSE => Some(self.handle_close(request_header, &mut cursor)),
             COMMAND_READ => Some(self.handle_read(request_header, &mut cursor)),
             COMMAND_WRITE => Some(self.handle_write(request_header, &mut cursor)),
+            COMMAND_QUERY_DIRECTORY => {
+                Some(self.handle_query_directory(request_header, &mut cursor))
+            }
             _ => None,
         }
+    }
+
+    fn handle_query_directory(
+        &mut self,
+        request_header: Header,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Vec<u8> {
+        let request = match QueryDirectoryRequest::read(cursor) {
+            Ok(r) => r,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        let handle = match self.open_files.get(&request.file_id_volatile) {
+            Some(h) => h.clone(),
+            None => return self.error_response(request_header, STATUS_FILE_CLOSED),
+        };
+
+        if !handle.is_directory() {
+            return self.error_response(request_header, STATUS_INVALID_PARAMETER);
+        }
+
+        if request.flags & QUERY_DIR_FLAG_RESTART_SCANS != 0 {
+            self.listed_dirs.remove(&request.file_id_volatile);
+        }
+
+        if self.listed_dirs.contains(&request.file_id_volatile) {
+            return self.error_response(request_header, STATUS_NO_MORE_FILES);
+        }
+
+        let entries = match handle.list_children() {
+            Ok(e) => e,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        if entries.is_empty() {
+            self.listed_dirs.insert(request.file_id_volatile);
+            return self.error_response(request_header, STATUS_NO_MORE_FILES);
+        }
+
+        let buffer = marshal_dir_entries(&entries);
+        self.listed_dirs.insert(request.file_id_volatile);
+
+        let response_header = Header {
+            structure_size: 64,
+            credit_charge: 0,
+            status: STATUS_SUCCESS,
+            command: COMMAND_QUERY_DIRECTORY,
+            credits: 1,
+            flags: SMB2_FLAGS_SERVER_TO_REDIR,
+            next_command: 0,
+            message_id: request_header.message_id,
+            reserved: 0,
+            tree_id: request_header.tree_id,
+            session_id: request_header.session_id,
+            signature: [0; 16],
+        };
+
+        let response_body = QueryDirectoryResponse {
+            structure_size: 9,
+            output_buffer: buffer,
+        };
+
+        let mut bytes = Vec::with_capacity(64 + 8 + response_body.output_buffer.len());
+        let mut out = Cursor::new(&mut bytes);
+        response_header
+            .write(&mut out)
+            .expect("header serialize cannot fail");
+        response_body
+            .write(&mut out)
+            .expect("query_directory response serialize cannot fail");
+        bytes
     }
 
     fn handle_write(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
@@ -270,6 +410,7 @@ impl ConnectionState {
 
         // Pull the handle out (drop completes when nothing else holds it).
         let handle = self.open_files.remove(&request.file_id_volatile);
+        self.listed_dirs.remove(&request.file_id_volatile);
         let size = handle.as_ref().map(|h| h.size()).unwrap_or(0);
 
         let response_header = Header {
@@ -337,6 +478,11 @@ impl ConnectionState {
         let file_id = self.next_file_id;
         self.next_file_id += 1;
         let size = handle.size();
+        let attrs = if handle.is_directory() {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
         self.open_files.insert(file_id, handle);
 
         let response_header = Header {
@@ -365,7 +511,7 @@ impl ConnectionState {
             change_time: 0,
             allocation_size: size,
             end_of_file: size,
-            file_attributes: FILE_ATTRIBUTE_NORMAL,
+            file_attributes: attrs,
             reserved2: 0,
             file_id_persistent: file_id,
             file_id_volatile: file_id,

@@ -150,13 +150,88 @@ impl InMemoryFs {
 
 impl smbserver::Filesystem for InMemoryFs {
     fn open(&self, path: &str) -> std::io::Result<std::sync::Arc<dyn smbserver::FileHandle>> {
-        match self.files.lock().unwrap().get(path) {
-            Some(data) => Ok(std::sync::Arc::new(MemFile { data: data.clone() })),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no such file: {path}"),
-            )),
+        let files = self.files.lock().unwrap();
+        // File match wins.
+        if let Some(data) = files.get(path) {
+            return Ok(std::sync::Arc::new(MemFile { data: data.clone() }));
         }
+        // Otherwise treat as directory if it's the root or has any descendants.
+        let is_root = path.is_empty();
+        let prefix = if is_root { String::new() } else { format!("{path}/") };
+        let has_children = files.keys().any(|p| p.starts_with(&prefix));
+        if is_root || has_children {
+            return Ok(std::sync::Arc::new(MemDir {
+                fs: self.clone(),
+                path: path.to_string(),
+            }));
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no such path: {path}"),
+        ))
+    }
+}
+
+impl InMemoryFs {
+    fn list_internal(&self, dir_path: &str) -> Vec<smbserver::DirEntry> {
+        let files = self.files.lock().unwrap();
+        let prefix = if dir_path.is_empty() {
+            String::new()
+        } else {
+            format!("{dir_path}/")
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut entries = Vec::new();
+        for (path, data) in files.iter() {
+            if !path.starts_with(&prefix) {
+                continue;
+            }
+            let rest = &path[prefix.len()..];
+            if rest.is_empty() {
+                continue;
+            }
+            match rest.find('/') {
+                Some(slash) => {
+                    let name = &rest[..slash];
+                    if seen.insert(name.to_string()) {
+                        entries.push(smbserver::DirEntry {
+                            name: name.to_string(),
+                            size: 0,
+                            is_dir: true,
+                        });
+                    }
+                }
+                None => {
+                    if seen.insert(rest.to_string()) {
+                        entries.push(smbserver::DirEntry {
+                            name: rest.to_string(),
+                            size: data.lock().unwrap().len() as u64,
+                            is_dir: false,
+                        });
+                    }
+                }
+            }
+        }
+        // Stable ordering for deterministic tests.
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries
+    }
+}
+
+struct MemDir {
+    fs: InMemoryFs,
+    path: String,
+}
+
+impl smbserver::FileHandle for MemDir {
+    fn size(&self) -> u64 {
+        0
+    }
+    fn is_directory(&self) -> bool {
+        true
+    }
+    fn list_children(&self) -> std::io::Result<Vec<smbserver::DirEntry>> {
+        Ok(self.fs.list_internal(&self.path))
     }
 }
 
