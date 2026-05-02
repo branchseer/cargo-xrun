@@ -23,6 +23,18 @@ pub mod flags {
     pub const NEGOTIATE_56: u32 = 0x8000_0000;
 }
 
+/// True if `buf` is an NTLMSSP AUTHENTICATE_MESSAGE (Type 3).
+pub fn is_authenticate_message(buf: &[u8]) -> bool {
+    if buf.len() < 12 {
+        return false;
+    }
+    if &buf[..8] != SIGNATURE.as_slice() {
+        return false;
+    }
+    let msg_type = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    msg_type == MESSAGE_TYPE_AUTHENTICATE
+}
+
 /// Build an NTLMSSP CHALLENGE_MESSAGE (Type 2).
 ///
 /// The challenge is a fixed value — for an "accept everything" handler

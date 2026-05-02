@@ -88,16 +88,10 @@ impl Server {
 
     fn handle_session_setup(&self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
         let request = SessionSetupRequest::read(cursor).ok();
-        if let Some(req) = &request {
-            eprintln!(
-                "[smbserver] SESSION_SETUP request: {} bytes in security_buffer",
-                req.security_buffer.len()
-            );
-            for chunk in req.security_buffer.chunks(16) {
-                let hex: String = chunk.iter().map(|b| format!("{b:02X} ")).collect();
-                eprintln!("[smbserver]   {hex}");
-            }
-        }
+        let is_authenticate = request
+            .as_ref()
+            .map(|r| ntlmssp::is_authenticate_message(&r.security_buffer))
+            .unwrap_or(false);
 
         let session_id = if request_header.session_id == 0 {
             FIRST_SESSION_ID
@@ -105,10 +99,16 @@ impl Server {
             request_header.session_id
         };
 
+        let (status, security_buffer) = if is_authenticate {
+            (STATUS_SUCCESS, vec![])
+        } else {
+            (STATUS_MORE_PROCESSING_REQUIRED, ntlmssp::challenge_message())
+        };
+
         let response_header = Header {
             structure_size: 64,
             credit_charge: 0,
-            status: STATUS_MORE_PROCESSING_REQUIRED,
+            status,
             command: COMMAND_SESSION_SETUP,
             credits: 1,
             flags: SMB2_FLAGS_SERVER_TO_REDIR,
@@ -122,8 +122,11 @@ impl Server {
 
         let response_body = SessionSetupResponse {
             structure_size: 9,
-            session_flags: 0,
-            security_buffer: ntlmssp::challenge_message(),
+            // SMB2_SESSION_FLAG_IS_GUEST so signing-required clients
+            // accept us without a real session key. Real auth backends
+            // would clear this and produce signed responses.
+            session_flags: if status == STATUS_SUCCESS { 0x0001 } else { 0 },
+            security_buffer,
         };
 
         let mut bytes = Vec::with_capacity(64 + 9);

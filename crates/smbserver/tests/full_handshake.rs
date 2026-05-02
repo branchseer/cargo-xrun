@@ -27,6 +27,7 @@ async fn client_can_connect_share_and_disconnect() {
     let transport = Box::new(DuplexTransport::new(client_io));
     let config = ConnectionConfig {
         smb2_only_negotiate: true,
+        allow_unsigned_guest_access: true,
         ..Default::default()
     };
 
