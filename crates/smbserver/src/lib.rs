@@ -70,6 +70,7 @@ const FILE_OPENED: u32 = 0x0000_0001;
 const FILE_CREATED: u32 = 0x0000_0002;
 /// CREATE Options bitfield values. MS-SMB2 §2.2.13.
 const CREATE_OPT_DIRECTORY_FILE: u32 = 0x0000_0001;
+const CREATE_OPT_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 /// CREATE Disposition values. MS-SMB2 §2.2.13.
 const FILE_DISP_SUPERSEDE: u32 = 0x0000_0000;
 const FILE_DISP_OPEN: u32 = 0x0000_0001;
@@ -81,6 +82,10 @@ const FILE_DISP_OVERWRITE_IF: u32 = 0x0000_0005;
 const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 /// Returned for QUERY_INFO/SET_INFO when the requested info class is unsupported.
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+/// Client opened with FILE_DIRECTORY_FILE but the path resolved to a file.
+const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+/// Client opened a file but the path resolved to a directory.
+const STATUS_FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
 /// QUERY_INFO/SET_INFO type codes. MS-SMB2 §2.2.37.
 const INFO_TYPE_FILE: u8 = 0x01;
 const INFO_TYPE_FILESYSTEM: u8 = 0x02;
@@ -1081,6 +1086,16 @@ impl ConnectionState {
             Ok(t) => t,
             Err(status) => return self.error_response(request_header, status),
         };
+
+        // Type check: enforce the client's stated intent.
+        let want_dir = request.create_options & CREATE_OPT_DIRECTORY_FILE != 0;
+        let want_non_dir = request.create_options & CREATE_OPT_NON_DIRECTORY_FILE != 0;
+        if want_dir && !handle.is_directory() {
+            return self.error_response(request_header, STATUS_NOT_A_DIRECTORY);
+        }
+        if want_non_dir && handle.is_directory() {
+            return self.error_response(request_header, STATUS_FILE_IS_A_DIRECTORY);
+        }
 
         let file_id = self.next_file_id;
         self.next_file_id += 1;
