@@ -1,3 +1,43 @@
+//! Pure-Rust SMB2 server with a pluggable filesystem backend.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use smbserver::{FileHandle, Filesystem, Server};
+//! use std::sync::Arc;
+//!
+//! struct MyFs;
+//! impl Filesystem for MyFs {
+//!     fn open(&self, _path: &str) -> std::io::Result<Arc<dyn FileHandle>> {
+//!         Err(std::io::Error::new(std::io::ErrorKind::NotFound, ""))
+//!     }
+//! }
+//!
+//! # async fn run<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(io: S) {
+//! let server = Server::builder().share("public", MyFs).build();
+//! // For each accepted connection (TCP, in-process pipe, anything that
+//! // implements AsyncRead + AsyncWrite + Unpin + Send):
+//! let _ = server.serve_connection(io).await;
+//! # }
+//! ```
+//!
+//! # Architecture
+//!
+//! - [`Server`] holds the share registry and is cheaply cloneable. Spawn one
+//!   `serve_connection` future per accepted socket.
+//! - [`Filesystem`] is the pluggable backend trait. Methods have sensible
+//!   defaults so a read-only backend only needs to implement `open`.
+//! - [`FileHandle`] represents one open file/directory. Required: `size`.
+//!   Optional: `read`, `write`, `truncate`, `flush`, `is_directory`,
+//!   `metadata`, `list_children`.
+//!
+//! # Authentication
+//!
+//! The current SESSION_SETUP handler accepts any NTLMSSP exchange and
+//! reports a guest session. There is no real credential validation. This
+//! is suitable for testing and trusted networks; do not expose to the
+//! public internet.
+
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
@@ -97,6 +137,7 @@ const FS_INFO_FULL_SIZE: u8 = 7;
 /// Common FileInformationClass values for QUERY_INFO. MS-FSCC §2.4.
 const FILE_INFO_BASIC: u8 = 4;
 const FILE_INFO_STANDARD: u8 = 5;
+const FILE_INFO_NAME: u8 = 9;
 const FILE_INFO_ALL: u8 = 18;
 const FILE_INFO_NETWORK_OPEN: u8 = 34;
 /// FileInformationClass values used by SET_INFO. MS-FSCC §2.4.
@@ -742,6 +783,16 @@ impl ConnectionState {
                 reserved: 0,
             }),
             FILE_INFO_ALL => marshal_file_all_information(&meta, attrs, path),
+            FILE_INFO_NAME => {
+                let name_bytes: Vec<u8> = path
+                    .encode_utf16()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect();
+                let mut buf = Vec::with_capacity(4 + name_bytes.len());
+                buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&name_bytes);
+                buf
+            }
             _ => return Err(STATUS_INVALID_INFO_CLASS),
         })
     }
@@ -772,7 +823,17 @@ impl ConnectionState {
     }
 
     fn handle_flush(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
-        let _ = FlushRequest::read(cursor);
+        let request = match FlushRequest::read(cursor) {
+            Ok(r) => r,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        if let Some(of) = self.open_files.get(&request.file_id_volatile)
+            && let Err(e) = of.handle.flush()
+        {
+            return self.error_response(request_header, map_io_err(e));
+        }
+
         let response_header = self.simple_response_header(&request_header, COMMAND_FLUSH);
         let response_body = FlushResponse {
             structure_size: 4,

@@ -151,6 +151,12 @@ pub trait FileHandle: Send + Sync {
             "FileHandle does not support truncate",
         ))
     }
+
+    /// Flush any buffered writes to durable storage. Called in response
+    /// to FLUSH. Default returns Ok (most backends are write-through).
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// One entry returned by `FileHandle::list_children`. The server marshals
