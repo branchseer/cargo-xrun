@@ -12,7 +12,7 @@ async fn client_can_open_existing_file() {
     fs.add_file("hello.txt", b"Hello, SMB!".to_vec());
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -44,7 +44,7 @@ async fn missing_file_returns_object_name_not_found() {
     let fs = InMemoryFs::new(); // empty
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {

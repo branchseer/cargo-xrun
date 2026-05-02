@@ -14,7 +14,7 @@ async fn client_write_overwrites_existing_bytes() {
     let fs_for_assert = fs.clone();
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -62,7 +62,7 @@ async fn client_reads_back_what_it_just_wrote() {
     fs.add_file("rw.txt", b"AAAAAAAA".to_vec());
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -106,7 +106,7 @@ async fn client_write_extends_file_past_eof() {
     let fs_for_assert = fs.clone();
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {

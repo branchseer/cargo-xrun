@@ -10,7 +10,7 @@ use smb::{Connection, ConnectionConfig, Guid};
 async fn client_negotiates_smb2() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
-    let server = smbserver::Server::builder().build(NoFs);
+    let server = smbserver::Server::builder().share("public", NoFs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {

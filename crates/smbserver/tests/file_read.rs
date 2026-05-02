@@ -13,7 +13,7 @@ async fn client_can_read_file_contents() {
     fs.add_file("hello.txt", b"Hello, SMB!".to_vec());
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -56,7 +56,7 @@ async fn client_can_read_file_at_offset() {
     fs.add_file("greeting.txt", b"Hello, world!".to_vec());
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {

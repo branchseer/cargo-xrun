@@ -25,7 +25,7 @@ async fn client_lists_root_directory() {
     fs.add_file("gamma/inner.dat", b"ccc".to_vec());
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -80,7 +80,7 @@ async fn client_lists_subdirectory() {
     fs.add_file("other.bin", b"x".to_vec());
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {

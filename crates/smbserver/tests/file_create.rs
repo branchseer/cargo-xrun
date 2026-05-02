@@ -24,7 +24,7 @@ async fn client_creates_new_file_then_writes_to_it() {
     let fs_for_assert = fs.clone();
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -63,7 +63,7 @@ async fn create_disposition_create_fails_when_file_exists() {
     fs.add_file("preexisting.txt", b"don't clobber me".to_vec());
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let server = smbserver::Server::builder().build(fs);
+    let server = smbserver::Server::builder().share("public", fs).build();
     let server_task = {
         let server = server.clone();
         tokio::spawn(async move {

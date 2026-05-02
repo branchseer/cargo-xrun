@@ -48,6 +48,7 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_FILE_CLOSED: u32 = 0xC000_0128;
 const STATUS_END_OF_FILE: u32 = 0xC000_0011;
 const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
+const STATUS_BAD_NETWORK_NAME: u32 = 0xC000_00CC;
 /// File attribute: directory. MS-FSCC §2.6.
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 /// QUERY_DIRECTORY request flag.
@@ -70,8 +71,6 @@ const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 const DIALECT_SMB_2_1: u16 = 0x0210;
 /// First session id we hand out. SMB session ids must be non-zero.
 const FIRST_SESSION_ID: u64 = 0x1000_0000_0000_0001;
-/// Tree id we hand out on TREE_CONNECT. Must be non-zero.
-const FIRST_TREE_ID: u32 = 0x0000_0001;
 /// Hardcoded server GUID. Real servers MAY persist this; for now a static
 /// value is fine — clients only echo it back during multichannel binding.
 const SERVER_GUID: [u8; 16] = *b"smbserver-rs\0\0\0\0";
@@ -82,12 +81,14 @@ pub struct Server {
 }
 
 struct Inner {
-    fs: Box<dyn Filesystem>,
+    /// Share name → backing filesystem. Names are case-insensitive on real
+    /// servers; we match case-insensitively too (lowercased on insertion).
+    shares: HashMap<String, Arc<dyn Filesystem>>,
 }
 
 #[derive(Default)]
 pub struct ServerBuilder {
-    _private: (),
+    shares: HashMap<String, Arc<dyn Filesystem>>,
 }
 
 impl Server {
@@ -128,9 +129,17 @@ impl Server {
 }
 
 impl ServerBuilder {
-    pub fn build(self, fs: impl Filesystem) -> Server {
+    /// Register `fs` as the share named `name`. Multiple calls add
+    /// multiple shares; clients route requests via the share component
+    /// of their TREE_CONNECT path.
+    pub fn share(mut self, name: impl Into<String>, fs: impl Filesystem) -> Self {
+        self.shares.insert(name.into().to_lowercase(), Arc::new(fs));
+        self
+    }
+
+    pub fn build(self) -> Server {
         Server {
-            inner: Arc::new(Inner { fs: Box::new(fs) }),
+            inner: Arc::new(Inner { shares: self.shares }),
         }
     }
 }
@@ -257,6 +266,21 @@ fn marshal_dir_entries(entries: &[DirEntry]) -> Vec<u8> {
     buf
 }
 
+/// Extract the share name from a TREE_CONNECT path like
+/// `\\server\share` or `\\server\share\subpath`. Returns `None` if the
+/// path is malformed (no share component).
+fn share_name_from_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_start_matches('\\');
+    // After trimming, expect "server\share" or "server\share\..."
+    let (_server, rest) = trimmed.split_once('\\')?;
+    let share = rest.split('\\').next()?;
+    if share.is_empty() {
+        None
+    } else {
+        Some(share.to_string())
+    }
+}
+
 /// Decode a UTF-16LE byte buffer (as carried in SMB2 name fields) to UTF-8.
 fn decode_utf16le(bytes: &[u8]) -> Result<String, std::string::FromUtf16Error> {
     let units: Vec<u16> = bytes
@@ -275,6 +299,10 @@ struct ConnectionState {
     /// FileIds whose directory listing has been fully delivered. Cleared
     /// when the client sends QUERY_DIRECTORY with the RESTART_SCANS flag.
     listed_dirs: HashSet<u64>,
+    /// TreeId → backing filesystem for that share. Populated on
+    /// TREE_CONNECT, cleared on TREE_DISCONNECT.
+    trees: HashMap<u32, Arc<dyn Filesystem>>,
+    next_tree_id: u32,
 }
 
 impl ConnectionState {
@@ -284,6 +312,8 @@ impl ConnectionState {
             open_files: HashMap::new(),
             next_file_id: 1,
             listed_dirs: HashSet::new(),
+            trees: HashMap::new(),
+            next_tree_id: 1,
         }
     }
 
@@ -318,6 +348,7 @@ impl ConnectionState {
         cursor: &mut Cursor<&[u8]>,
     ) -> Vec<u8> {
         let _ = TreeDisconnectRequest::read(cursor);
+        self.trees.remove(&request_header.tree_id);
         let response_header = self.simple_response_header(&request_header, COMMAND_TREE_DISCONNECT);
         let response_body = TreeDisconnectResponse {
             structure_size: 4,
@@ -617,14 +648,16 @@ impl ConnectionState {
             Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
         };
 
-        let (handle, action) = match dispatch_create(
-            &*self.inner.fs,
-            &path,
-            request.create_disposition,
-        ) {
-            Ok(t) => t,
-            Err(status) => return self.error_response(request_header, status),
+        let fs = match self.trees.get(&request_header.tree_id) {
+            Some(fs) => fs.clone(),
+            None => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
         };
+
+        let (handle, action) =
+            match dispatch_create(&*fs, &path, request.create_disposition) {
+                Ok(t) => t,
+                Err(status) => return self.error_response(request_header, status),
+            };
 
         let file_id = self.next_file_id;
         self.next_file_id += 1;
@@ -718,7 +751,29 @@ impl ConnectionState {
         request_header: Header,
         cursor: &mut Cursor<&[u8]>,
     ) -> Vec<u8> {
-        let _ = TreeConnectRequest::read(cursor);
+        let request = match TreeConnectRequest::read(cursor) {
+            Ok(r) => r,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        let path = match decode_utf16le(&request.path) {
+            Ok(p) => p,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        let share_name = match share_name_from_path(&path) {
+            Some(name) => name,
+            None => return self.error_response(request_header, STATUS_BAD_NETWORK_NAME),
+        };
+
+        let fs = match self.inner.shares.get(&share_name.to_lowercase()) {
+            Some(fs) => fs.clone(),
+            None => return self.error_response(request_header, STATUS_BAD_NETWORK_NAME),
+        };
+
+        let tree_id = self.next_tree_id;
+        self.next_tree_id += 1;
+        self.trees.insert(tree_id, fs);
 
         let response_header = Header {
             structure_size: 64,
@@ -730,7 +785,7 @@ impl ConnectionState {
             next_command: 0,
             message_id: request_header.message_id,
             reserved: 0,
-            tree_id: FIRST_TREE_ID,
+            tree_id,
             session_id: request_header.session_id,
             signature: [0; 16],
         };
@@ -744,15 +799,7 @@ impl ConnectionState {
             maximal_access: 0x001F_01FF,
         };
 
-        let mut bytes = Vec::with_capacity(64 + 16);
-        let mut out = Cursor::new(&mut bytes);
-        response_header
-            .write(&mut out)
-            .expect("header serialize cannot fail for fixed-size struct");
-        response_body
-            .write(&mut out)
-            .expect("tree_connect response serialize cannot fail");
-        bytes
+        write_response(response_header, response_body, 16)
     }
 
     fn handle_session_setup(
