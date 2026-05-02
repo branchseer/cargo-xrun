@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
+pub mod wire;
+
 pub trait Filesystem: Send + Sync + 'static {}
 
 #[derive(Clone)]
