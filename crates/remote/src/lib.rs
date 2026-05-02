@@ -123,26 +123,37 @@ pub fn main() -> std::process::ExitCode {
     #[cfg(not(windows))]
     let ctx = decode::decode_context(&args[1]).unwrap();
 
-    // On Windows, use UNC paths directly with extended-length prefix (\\?\UNC\)
-    // to avoid the 260-char path limit. No drive letter mapping (subst) needed —
-    // subst adds an indirection layer through MiniRdr that causes flaky
-    // ERROR_BAD_NETPATH under concurrent directory listing.
+    // On Windows, use two path strategies:
+    // 1. \\?\UNC\ (extended-length) for cwd and bin_path — avoids the 260-char
+    //    path limit for direct file access.
+    // 2. Drive letter via subst for env vars — the Windows WebDAV client
+    //    (WebClient service) requires a warm-up read to establish the
+    //    connection for each UNC path. Child processes spawned inside
+    //    ConPTY sessions don't inherit this connection state, causing
+    //    intermittent "path not found" errors on first access. Subst
+    //    drive letters avoid this by going through the local filesystem
+    //    namespace.
     #[cfg(windows)]
-    {
-        // Transform \\server\share paths to \\?\UNC\server\share for extended-length support
+    let _mount = {
+        // Map a drive letter for env var paths.
+        let mount = WebDavMount::mount(&ctx.webdav_path).unwrap();
+        ctx.envs = ctx.envs
+            .into_iter()
+            .map(|(k, v)| (k, mount.transform_path(&v)))
+            .collect();
+
+        // Use \\?\UNC\ for cwd and bin_path (260-char limit avoidance).
         let unc_prefix = format!("\\\\?\\UNC\\{}", ctx.webdav_path.trim_start_matches("\\\\"));
         let webdav_prefix_with_slash = format!("{}\\", ctx.webdav_path);
         let unc_prefix_with_slash = format!("{}\\", unc_prefix);
-        let transform = |path: &str| -> String {
+        let to_unc = |path: &str| -> String {
             path.replace(&webdav_prefix_with_slash, &unc_prefix_with_slash)
         };
-        ctx.cwd = transform(&ctx.cwd);
-        ctx.bin_path = transform(&ctx.bin_path);
-        ctx.envs = ctx.envs
-            .into_iter()
-            .map(|(k, v)| (k, transform(&v)))
-            .collect();
-    }
+        ctx.cwd = to_unc(&ctx.cwd);
+        ctx.bin_path = to_unc(&ctx.bin_path);
+
+        mount // keep alive until process exits
+    };
 
     env::set_current_dir(&ctx.cwd).unwrap();
 
@@ -162,6 +173,24 @@ pub fn main() -> std::process::ExitCode {
     #[cfg(windows)]
     {
         use std::process::ExitCode;
+
+        // Windows OpenSSH server creates the session process with
+        // CREATE_NEW_PROCESS_GROUP, which implicitly sets the per-process
+        // CONSOLE_IGNORE_CTRL_C flag (PEB ConsoleFlags). This flag is
+        // inherited by all descendants and silently drops CTRL_C_EVENT
+        // before it reaches registered handlers. Clear it so that child
+        // processes (e.g. ConPTY-based tests) can receive Ctrl+C normally.
+        // SAFETY: Clearing the inherited CTRL_C ignore flag with valid Win32 API args.
+        unsafe {
+            unsafe extern "system" {
+                fn SetConsoleCtrlHandler(
+                    handler: Option<unsafe extern "system" fn(u32) -> i32>,
+                    add: i32,
+                ) -> i32;
+            }
+            SetConsoleCtrlHandler(None, 0); // 0 = FALSE = clear ignore flag
+        }
+
         let status = match cmd.status() {
             Ok(s) => s,
             Err(err) if err.kind() == std::io::ErrorKind::FileTooLarge => {
