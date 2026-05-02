@@ -42,13 +42,13 @@ async fn client_can_connect_share_and_disconnect() {
     let session = conn.authenticate(identity).await.expect("SESSION_SETUP failed");
 
     let target = UncPath::from_str(r"\\test-server\public").expect("valid UNC path");
-    let _tree = session.tree_connect(&target).await.expect("TREE_CONNECT failed");
+    let tree = session.tree_connect(&target).await.expect("TREE_CONNECT failed");
 
-    // Drop order: tree → session → connection. smb-rs's Drop impls send
-    // TREE_DISCONNECT and LOGOFF on the way out; if the server never replies
-    // they hang, so the ntest timeout is the safety net.
-    drop(_tree);
-    drop(session);
+    // Explicit, awaitable shutdown — exercises TREE_DISCONNECT and LOGOFF
+    // handlers in a way the Drop fire-and-forget path cannot verify.
+    tree.disconnect().await.expect("TREE_DISCONNECT failed");
+    session.logoff().await.expect("LOGOFF failed");
+
     drop(conn);
     server_task.abort();
 }

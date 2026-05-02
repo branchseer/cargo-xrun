@@ -13,24 +13,32 @@ pub use fs::{DirEntry, FileHandle, Filesystem};
 
 use wire::close::{CloseRequest, CloseResponse};
 use wire::create::{CreateRequest, CreateResponse};
+use wire::echo::{EchoRequest, EchoResponse};
 use wire::error::ErrorResponse;
+use wire::flush::{FlushRequest, FlushResponse};
 use wire::fscc::FileBothDirectoryInformation;
 use wire::header::Header;
+use wire::logoff::{LogoffRequest, LogoffResponse};
 use wire::negotiate::{NegotiateRequest, NegotiateResponse};
 use wire::query_directory::{QueryDirectoryRequest, QueryDirectoryResponse};
 use wire::read::{ReadRequest, ReadResponse};
 use wire::session_setup::{SessionSetupRequest, SessionSetupResponse};
 use wire::tree_connect::{TreeConnectRequest, TreeConnectResponse};
+use wire::tree_disconnect::{TreeDisconnectRequest, TreeDisconnectResponse};
 use wire::write::{WriteRequest, WriteResponse};
 
 const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
 const COMMAND_NEGOTIATE: u16 = 0x0000;
 const COMMAND_SESSION_SETUP: u16 = 0x0001;
+const COMMAND_LOGOFF: u16 = 0x0002;
 const COMMAND_TREE_CONNECT: u16 = 0x0003;
+const COMMAND_TREE_DISCONNECT: u16 = 0x0004;
 const COMMAND_CREATE: u16 = 0x0005;
 const COMMAND_CLOSE: u16 = 0x0006;
+const COMMAND_FLUSH: u16 = 0x0007;
 const COMMAND_READ: u16 = 0x0008;
 const COMMAND_WRITE: u16 = 0x0009;
+const COMMAND_ECHO: u16 = 0x000D;
 const COMMAND_QUERY_DIRECTORY: u16 = 0x000E;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
@@ -125,6 +133,21 @@ impl ServerBuilder {
             inner: Arc::new(Inner { fs: Box::new(fs) }),
         }
     }
+}
+
+/// Serialize a header + body pair into a single response buffer.
+fn write_response<B>(header: Header, body: B, body_size_hint: usize) -> Vec<u8>
+where
+    B: BinWrite + binrw::meta::WriteEndian,
+    for<'a> B: BinWrite<Args<'a> = ()>,
+{
+    let mut bytes = Vec::with_capacity(64 + body_size_hint);
+    let mut out = Cursor::new(&mut bytes);
+    header
+        .write(&mut out)
+        .expect("header serialize cannot fail");
+    body.write(&mut out).expect("body serialize cannot fail");
+    bytes
 }
 
 /// Resolve an SMB CREATE disposition into Filesystem ops, returning the
@@ -279,7 +302,74 @@ impl ConnectionState {
             COMMAND_QUERY_DIRECTORY => {
                 Some(self.handle_query_directory(request_header, &mut cursor))
             }
+            COMMAND_TREE_DISCONNECT => {
+                Some(self.handle_tree_disconnect(request_header, &mut cursor))
+            }
+            COMMAND_LOGOFF => Some(self.handle_logoff(request_header, &mut cursor)),
+            COMMAND_FLUSH => Some(self.handle_flush(request_header, &mut cursor)),
+            COMMAND_ECHO => Some(self.handle_echo(request_header, &mut cursor)),
             _ => None,
+        }
+    }
+
+    fn handle_tree_disconnect(
+        &mut self,
+        request_header: Header,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Vec<u8> {
+        let _ = TreeDisconnectRequest::read(cursor);
+        let response_header = self.simple_response_header(&request_header, COMMAND_TREE_DISCONNECT);
+        let response_body = TreeDisconnectResponse {
+            structure_size: 4,
+            reserved: 0,
+        };
+        write_response(response_header, response_body, 4)
+    }
+
+    fn handle_logoff(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+        let _ = LogoffRequest::read(cursor);
+        let response_header = self.simple_response_header(&request_header, COMMAND_LOGOFF);
+        let response_body = LogoffResponse {
+            structure_size: 4,
+            reserved: 0,
+        };
+        write_response(response_header, response_body, 4)
+    }
+
+    fn handle_flush(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+        let _ = FlushRequest::read(cursor);
+        let response_header = self.simple_response_header(&request_header, COMMAND_FLUSH);
+        let response_body = FlushResponse {
+            structure_size: 4,
+            reserved: 0,
+        };
+        write_response(response_header, response_body, 4)
+    }
+
+    fn handle_echo(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+        let _ = EchoRequest::read(cursor);
+        let response_header = self.simple_response_header(&request_header, COMMAND_ECHO);
+        let response_body = EchoResponse {
+            structure_size: 4,
+            reserved: 0,
+        };
+        write_response(response_header, response_body, 4)
+    }
+
+    fn simple_response_header(&self, request_header: &Header, command: u16) -> Header {
+        Header {
+            structure_size: 64,
+            credit_charge: 0,
+            status: STATUS_SUCCESS,
+            command,
+            credits: 1,
+            flags: SMB2_FLAGS_SERVER_TO_REDIR,
+            next_command: 0,
+            message_id: request_header.message_id,
+            reserved: 0,
+            tree_id: request_header.tree_id,
+            session_id: request_header.session_id,
+            signature: [0; 16],
         }
     }
 
