@@ -9,18 +9,22 @@ pub mod fs;
 pub mod ntlmssp;
 pub mod wire;
 
-pub use fs::{DirEntry, FileHandle, Filesystem};
+pub use fs::{DirEntry, FileHandle, FileMetadata, Filesystem};
 
 use wire::close::{CloseRequest, CloseResponse};
 use wire::create::{CreateRequest, CreateResponse};
 use wire::echo::{EchoRequest, EchoResponse};
 use wire::error::ErrorResponse;
 use wire::flush::{FlushRequest, FlushResponse};
-use wire::fscc::FileBothDirectoryInformation;
+use wire::fscc::{
+    FileBasicInformation, FileBothDirectoryInformation, FileNetworkOpenInformation,
+    FileStandardInformation,
+};
 use wire::header::Header;
 use wire::logoff::{LogoffRequest, LogoffResponse};
 use wire::negotiate::{NegotiateRequest, NegotiateResponse};
 use wire::query_directory::{QueryDirectoryRequest, QueryDirectoryResponse};
+use wire::query_info::{QueryInfoRequest, QueryInfoResponse};
 use wire::read::{ReadRequest, ReadResponse};
 use wire::session_setup::{SessionSetupRequest, SessionSetupResponse};
 use wire::tree_connect::{TreeConnectRequest, TreeConnectResponse};
@@ -40,6 +44,7 @@ const COMMAND_READ: u16 = 0x0008;
 const COMMAND_WRITE: u16 = 0x0009;
 const COMMAND_ECHO: u16 = 0x000D;
 const COMMAND_QUERY_DIRECTORY: u16 = 0x000E;
+const COMMAND_QUERY_INFO: u16 = 0x0010;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -68,6 +73,14 @@ const FILE_DISP_OVERWRITE: u32 = 0x0000_0004;
 const FILE_DISP_OVERWRITE_IF: u32 = 0x0000_0005;
 /// Status returned for CREATE Create disposition when target exists.
 const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+/// Returned for QUERY_INFO/SET_INFO when the requested info class is unsupported.
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+/// QUERY_INFO/SET_INFO type codes. MS-SMB2 §2.2.37.
+const INFO_TYPE_FILE: u8 = 0x01;
+/// Common FileInformationClass values for QUERY_INFO. MS-FSCC §2.4.
+const FILE_INFO_BASIC: u8 = 4;
+const FILE_INFO_STANDARD: u8 = 5;
+const FILE_INFO_NETWORK_OPEN: u8 = 34;
 const DIALECT_SMB_2_1: u16 = 0x0210;
 /// First session id we hand out. SMB session ids must be non-zero.
 const FIRST_SESSION_ID: u64 = 0x1000_0000_0000_0001;
@@ -142,6 +155,19 @@ impl ServerBuilder {
             inner: Arc::new(Inner { shares: self.shares }),
         }
     }
+}
+
+/// Serialize a single binrw struct to its wire bytes.
+fn serialize_body<B>(value: &B) -> Vec<u8>
+where
+    B: BinWrite + binrw::meta::WriteEndian,
+    for<'a> B: BinWrite<Args<'a> = ()>,
+{
+    let mut bytes = Vec::new();
+    value
+        .write(&mut Cursor::new(&mut bytes))
+        .expect("body serialize cannot fail");
+    bytes
 }
 
 /// Serialize a header + body pair into a single response buffer.
@@ -338,8 +364,69 @@ impl ConnectionState {
             COMMAND_LOGOFF => Some(self.handle_logoff(request_header, &mut cursor)),
             COMMAND_FLUSH => Some(self.handle_flush(request_header, &mut cursor)),
             COMMAND_ECHO => Some(self.handle_echo(request_header, &mut cursor)),
+            COMMAND_QUERY_INFO => Some(self.handle_query_info(request_header, &mut cursor)),
             _ => None,
         }
+    }
+
+    fn handle_query_info(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+        let request = match QueryInfoRequest::read(cursor) {
+            Ok(r) => r,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        let handle = match self.open_files.get(&request.file_id_volatile) {
+            Some(h) => h.clone(),
+            None => return self.error_response(request_header, STATUS_FILE_CLOSED),
+        };
+
+        if request.info_type != INFO_TYPE_FILE {
+            return self.error_response(request_header, STATUS_INVALID_INFO_CLASS);
+        }
+
+        let meta = handle.metadata();
+        let attrs = if meta.is_directory {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
+
+        let buffer = match request.file_info_class {
+            FILE_INFO_BASIC => serialize_body(&FileBasicInformation {
+                creation_time: meta.creation_time,
+                last_access_time: meta.last_access_time,
+                last_write_time: meta.last_write_time,
+                change_time: meta.change_time,
+                file_attributes: attrs,
+                reserved: 0,
+            }),
+            FILE_INFO_STANDARD => serialize_body(&FileStandardInformation {
+                allocation_size: meta.allocation_size,
+                end_of_file: meta.size,
+                number_of_links: 1,
+                delete_pending: 0,
+                directory: meta.is_directory as u8,
+                reserved: 0,
+            }),
+            FILE_INFO_NETWORK_OPEN => serialize_body(&FileNetworkOpenInformation {
+                creation_time: meta.creation_time,
+                last_access_time: meta.last_access_time,
+                last_write_time: meta.last_write_time,
+                change_time: meta.change_time,
+                allocation_size: meta.allocation_size,
+                end_of_file: meta.size,
+                file_attributes: attrs,
+                reserved: 0,
+            }),
+            _ => return self.error_response(request_header, STATUS_INVALID_INFO_CLASS),
+        };
+
+        let response_header = self.simple_response_header(&request_header, COMMAND_QUERY_INFO);
+        let response_body = QueryInfoResponse {
+            structure_size: 9,
+            output_buffer: buffer,
+        };
+        write_response(response_header, response_body, 0)
     }
 
     fn handle_tree_disconnect(

@@ -35,6 +35,21 @@ pub trait FileHandle: Send + Sync {
         false
     }
 
+    /// Full metadata for QUERY_INFO responses. The default composes
+    /// from `size()` and `is_directory()` with zero timestamps;
+    /// backends with real timestamps should override.
+    fn metadata(&self) -> FileMetadata {
+        FileMetadata {
+            size: self.size(),
+            allocation_size: self.size(),
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            is_directory: self.is_directory(),
+        }
+    }
+
     /// Read up to `len` bytes starting at `offset`. Returns fewer bytes
     /// than requested only at end-of-file.
     fn read(&self, _offset: u64, _len: u32) -> io::Result<Vec<u8>> {
@@ -70,4 +85,20 @@ pub struct DirEntry {
     pub name: String,
     pub size: u64,
     pub is_dir: bool,
+}
+
+/// Metadata for a single open handle. Returned by `FileHandle::metadata`
+/// and consumed by the server's QUERY_INFO handler.
+///
+/// Timestamps are Windows FILETIME (100-ns ticks since 1601-01-01 UTC).
+/// Zero is acceptable for backends without real timestamps.
+#[derive(Debug, Clone, Default)]
+pub struct FileMetadata {
+    pub size: u64,
+    pub allocation_size: u64,
+    pub creation_time: u64,
+    pub last_access_time: u64,
+    pub last_write_time: u64,
+    pub change_time: u64,
+    pub is_directory: bool,
 }
