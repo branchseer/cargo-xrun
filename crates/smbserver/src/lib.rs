@@ -85,6 +85,7 @@ const INFO_TYPE_FILE: u8 = 0x01;
 /// Common FileInformationClass values for QUERY_INFO. MS-FSCC §2.4.
 const FILE_INFO_BASIC: u8 = 4;
 const FILE_INFO_STANDARD: u8 = 5;
+const FILE_INFO_ALL: u8 = 18;
 const FILE_INFO_NETWORK_OPEN: u8 = 34;
 /// FileInformationClass values used by SET_INFO. MS-FSCC §2.4.
 const FILE_INFO_RENAME: u8 = 10;
@@ -164,6 +165,47 @@ impl ServerBuilder {
             inner: Arc::new(Inner { shares: self.shares }),
         }
     }
+}
+
+/// Marshal a FileAllInformation (MS-FSCC §2.4.2): concatenation of
+/// FileBasic + FileStandard + FileInternal + FileEa + FileAccess +
+/// FilePosition + FileMode + FileAlignment + FileName.
+fn marshal_file_all_information(meta: &FileMetadata, attrs: u32, path: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+    // FileBasicInformation (40 bytes)
+    buf.extend_from_slice(&meta.creation_time.to_le_bytes());
+    buf.extend_from_slice(&meta.last_access_time.to_le_bytes());
+    buf.extend_from_slice(&meta.last_write_time.to_le_bytes());
+    buf.extend_from_slice(&meta.change_time.to_le_bytes());
+    buf.extend_from_slice(&attrs.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    // FileStandardInformation (24 bytes)
+    buf.extend_from_slice(&meta.allocation_size.to_le_bytes());
+    buf.extend_from_slice(&meta.size.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes()); // number_of_links
+    buf.push(0); // delete_pending
+    buf.push(meta.is_directory as u8);
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    // FileInternalInformation (8 bytes) — IndexNumber; we have no inode, use 0
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    // FileEaInformation (4 bytes) — EaSize
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // FileAccessInformation (4 bytes) — AccessFlags; report a generous mask
+    buf.extend_from_slice(&0x001F_01FFu32.to_le_bytes());
+    // FilePositionInformation (8 bytes) — CurrentByteOffset
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    // FileModeInformation (4 bytes) — Mode
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // FileAlignmentInformation (4 bytes) — AlignmentRequirement (0 = byte)
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // FileNameInformation: FileNameLength (4) + FileName (UTF-16LE).
+    let name_bytes: Vec<u8> = path
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&name_bytes);
+    buf
 }
 
 /// Serialize a single binrw struct to its wire bytes.
@@ -548,8 +590,8 @@ impl ConnectionState {
             Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
         };
 
-        let handle = match self.open_files.get(&request.file_id_volatile) {
-            Some(of) => of.handle.clone(),
+        let (handle, path) = match self.open_files.get(&request.file_id_volatile) {
+            Some(of) => (of.handle.clone(), of.path.clone()),
             None => return self.error_response(request_header, STATUS_FILE_CLOSED),
         };
 
@@ -591,6 +633,7 @@ impl ConnectionState {
                 file_attributes: attrs,
                 reserved: 0,
             }),
+            FILE_INFO_ALL => marshal_file_all_information(&meta, attrs, &path),
             _ => return self.error_response(request_header, STATUS_INVALID_INFO_CLASS),
         };
 

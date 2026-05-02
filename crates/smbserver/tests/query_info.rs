@@ -4,7 +4,8 @@ mod common;
 
 use common::{connect_and_tree_connect, InMemoryFs};
 use smb_fscc::{
-    FileAccessMask, FileBasicInformation, FileNetworkOpenInformation, FileStandardInformation,
+    FileAccessMask, FileAllInformation, FileBasicInformation, FileNetworkOpenInformation,
+    FileStandardInformation,
 };
 
 #[tokio::test]
@@ -79,6 +80,50 @@ async fn query_basic_info_reports_normal_attributes_for_file() {
     assert!(!info.file_attributes.directory());
     // Our default metadata reports zero timestamps; verify they're carried through.
     assert!(info.creation_time.is_zero());
+
+    drop(file);
+    drop(tree);
+    drop(session);
+    drop(conn);
+    server_task.abort();
+}
+
+#[tokio::test]
+#[ntest::timeout(5000)]
+async fn query_all_information_returns_size_and_path() {
+    let mut fs = InMemoryFs::new();
+    fs.add_file("subdir/all.dat", vec![0u8; 42]);
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = smbserver::Server::builder().share("public", fs).build();
+    let server_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve_connection(server_io).await;
+        })
+    };
+
+    let (conn, session, tree) =
+        connect_and_tree_connect(client_io, r"\\test-server\public").await;
+
+    let resource = tree
+        .open_existing(
+            "subdir/all.dat",
+            FileAccessMask::new().with_file_read_attributes(true),
+        )
+        .await
+        .expect("open subdir/all.dat failed");
+    let file = resource.unwrap_file();
+
+    let info: FileAllInformation = file
+        .handle()
+        .query_info()
+        .await
+        .expect("QUERY_INFO All failed");
+    assert_eq!(info.standard.end_of_file, 42);
+    assert_eq!(info.standard.number_of_links, 1);
+    assert!(!Into::<bool>::into(info.standard.directory));
+    assert_eq!(info.name.file_name.to_string(), "subdir/all.dat");
 
     drop(file);
     drop(tree);
