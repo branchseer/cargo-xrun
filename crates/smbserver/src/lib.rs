@@ -8,11 +8,16 @@ pub mod wire;
 
 use wire::header::Header;
 use wire::negotiate::{NegotiateRequest, NegotiateResponse};
+use wire::session_setup::{SessionSetupRequest, SessionSetupResponse};
 
 const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
 const COMMAND_NEGOTIATE: u16 = 0x0000;
+const COMMAND_SESSION_SETUP: u16 = 0x0001;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
+const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
 const DIALECT_SMB_2_1: u16 = 0x0210;
+/// First session id we hand out. SMB session ids must be non-zero.
+const FIRST_SESSION_ID: u64 = 0x1000_0000_0000_0001;
 /// Hardcoded server GUID. Real servers MAY persist this; for now a static
 /// value is fine — clients only echo it back during multichannel binding.
 const SERVER_GUID: [u8; 16] = *b"smbserver-rs\0\0\0\0";
@@ -75,8 +80,50 @@ impl Server {
 
         match request_header.command {
             COMMAND_NEGOTIATE => Some(self.handle_negotiate(request_header, &mut cursor)),
+            COMMAND_SESSION_SETUP => Some(self.handle_session_setup(request_header, &mut cursor)),
             _ => None,
         }
+    }
+
+    fn handle_session_setup(&self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+        let _ = SessionSetupRequest::read(cursor);
+
+        let session_id = if request_header.session_id == 0 {
+            FIRST_SESSION_ID
+        } else {
+            request_header.session_id
+        };
+
+        let response_header = Header {
+            structure_size: 64,
+            credit_charge: 0,
+            status: STATUS_MORE_PROCESSING_REQUIRED,
+            command: COMMAND_SESSION_SETUP,
+            credits: 1,
+            flags: SMB2_FLAGS_SERVER_TO_REDIR,
+            next_command: 0,
+            message_id: request_header.message_id,
+            reserved: 0,
+            tree_id: 0,
+            session_id,
+            signature: [0; 16],
+        };
+
+        let response_body = SessionSetupResponse {
+            structure_size: 9,
+            session_flags: 0,
+            security_buffer: vec![],
+        };
+
+        let mut bytes = Vec::with_capacity(64 + 9);
+        let mut out = Cursor::new(&mut bytes);
+        response_header
+            .write(&mut out)
+            .expect("header serialize cannot fail for fixed-size struct");
+        response_body
+            .write(&mut out)
+            .expect("session_setup response serialize cannot fail");
+        bytes
     }
 
     fn handle_negotiate(&self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
