@@ -102,4 +102,11 @@ impl SmbTransportWrite for WriteHalfTransport {
 }
 
 pub struct NoFs;
-impl smbserver::Filesystem for NoFs {}
+impl smbserver::Filesystem for NoFs {
+    fn open(&self, _path: &str) -> std::io::Result<std::sync::Arc<dyn smbserver::FileHandle>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "NoFs has no files",
+        ))
+    }
+}

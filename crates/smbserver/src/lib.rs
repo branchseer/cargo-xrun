@@ -4,8 +4,11 @@ use std::sync::Arc;
 use binrw::{BinRead, BinWrite};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod fs;
 pub mod ntlmssp;
 pub mod wire;
+
+pub use fs::{FileHandle, Filesystem};
 
 use wire::header::Header;
 use wire::negotiate::{NegotiateRequest, NegotiateResponse};
@@ -26,8 +29,6 @@ const FIRST_TREE_ID: u32 = 0x0000_0001;
 /// Hardcoded server GUID. Real servers MAY persist this; for now a static
 /// value is fine — clients only echo it back during multichannel binding.
 const SERVER_GUID: [u8; 16] = *b"smbserver-rs\0\0\0\0";
-
-pub trait Filesystem: Send + Sync + 'static {}
 
 #[derive(Clone)]
 pub struct Server {
