@@ -24,6 +24,15 @@ pub trait Filesystem: Send + Sync + 'static {
         ))
     }
 
+    /// Create a new directory at `path` and return a handle to it.
+    /// Default rejects with `Unsupported`.
+    fn create_dir(&self, _path: &str) -> io::Result<Arc<dyn FileHandle>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem does not support mkdir",
+        ))
+    }
+
     /// Rename `from` to `to`. Default rejects with `Unsupported`.
     fn rename(&self, _from: &str, _to: &str) -> io::Result<()> {
         Err(io::Error::new(

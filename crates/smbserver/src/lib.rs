@@ -67,6 +67,8 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_OPENED: u32 = 0x0000_0001;
 /// CREATE Action: new file was created. MS-SMB2 §2.2.14.
 const FILE_CREATED: u32 = 0x0000_0002;
+/// CREATE Options bitfield values. MS-SMB2 §2.2.13.
+const CREATE_OPT_DIRECTORY_FILE: u32 = 0x0000_0001;
 /// CREATE Disposition values. MS-SMB2 §2.2.13.
 const FILE_DISP_SUPERSEDE: u32 = 0x0000_0000;
 const FILE_DISP_OPEN: u32 = 0x0000_0001;
@@ -194,11 +196,24 @@ where
 
 /// Resolve an SMB CREATE disposition into Filesystem ops, returning the
 /// resulting handle and the `create_action` value to report to the client.
+///
+/// `create_options` selects between file and directory creation: when the
+/// `FILE_DIRECTORY_FILE` bit is set, creates route through `create_dir`
+/// instead of `create`.
 fn dispatch_create(
     fs: &dyn Filesystem,
     path: &str,
     disposition: u32,
+    create_options: u32,
 ) -> Result<(Arc<dyn FileHandle>, u32), u32> {
+    let create = || {
+        if create_options & CREATE_OPT_DIRECTORY_FILE != 0 {
+            fs.create_dir(path)
+        } else {
+            fs.create(path)
+        }
+    };
+
     match disposition {
         FILE_DISP_OPEN => fs
             .open(path)
@@ -206,29 +221,24 @@ fn dispatch_create(
             .map_err(map_io_err),
         FILE_DISP_CREATE => match fs.open(path) {
             Ok(_) => Err(STATUS_OBJECT_NAME_COLLISION),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs
-                .create(path)
-                .map(|h| (h, FILE_CREATED))
-                .map_err(map_io_err),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                create().map(|h| (h, FILE_CREATED)).map_err(map_io_err)
+            }
             Err(e) => Err(map_io_err(e)),
         },
         FILE_DISP_OPEN_IF => match fs.open(path) {
             Ok(h) => Ok((h, FILE_OPENED)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs
-                .create(path)
-                .map(|h| (h, FILE_CREATED))
-                .map_err(map_io_err),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                create().map(|h| (h, FILE_CREATED)).map_err(map_io_err)
+            }
             Err(e) => Err(map_io_err(e)),
         },
-        FILE_DISP_SUPERSEDE | FILE_DISP_OVERWRITE_IF => match fs.create(path) {
+        FILE_DISP_SUPERSEDE | FILE_DISP_OVERWRITE_IF => match create() {
             Ok(h) => Ok((h, FILE_CREATED)),
             Err(e) => Err(map_io_err(e)),
         },
         FILE_DISP_OVERWRITE => match fs.open(path) {
-            Ok(_) => fs
-                .create(path)
-                .map(|h| (h, FILE_CREATED))
-                .map_err(map_io_err),
+            Ok(_) => create().map(|h| (h, FILE_CREATED)).map_err(map_io_err),
             Err(e) => Err(map_io_err(e)),
         },
         _ => Err(STATUS_INVALID_PARAMETER),
@@ -849,11 +859,15 @@ impl ConnectionState {
             None => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
         };
 
-        let (handle, action) =
-            match dispatch_create(&*fs, &path, request.create_disposition) {
-                Ok(t) => t,
-                Err(status) => return self.error_response(request_header, status),
-            };
+        let (handle, action) = match dispatch_create(
+            &*fs,
+            &path,
+            request.create_disposition,
+            request.create_options,
+        ) {
+            Ok(t) => t,
+            Err(status) => return self.error_response(request_header, status),
+        };
 
         let file_id = self.next_file_id;
         self.next_file_id += 1;

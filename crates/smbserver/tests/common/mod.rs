@@ -114,6 +114,9 @@ impl smbserver::Filesystem for NoFs {
 
 /// In-memory filesystem for tests. Files are pre-populated; opens look up
 /// by exact path match. Writes are visible across handles to the same path.
+///
+/// Directories are inferred from file paths plus an explicit set populated
+/// by `add_directory` and `create_dir` (so empty directories can exist).
 #[derive(Default, Clone)]
 pub struct InMemoryFs {
     files: std::sync::Arc<
@@ -121,6 +124,7 @@ pub struct InMemoryFs {
             std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
         >,
     >,
+    explicit_dirs: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl InMemoryFs {
@@ -135,6 +139,16 @@ impl InMemoryFs {
             .lock()
             .unwrap()
             .insert(path, std::sync::Arc::new(std::sync::Mutex::new(content)));
+    }
+
+    /// Mark `path` as an existing directory. Lets tests assert clients can
+    /// open empty directories (no children to infer from).
+    pub fn has_directory(&self, path: &str) -> bool {
+        self.explicit_dirs.lock().unwrap().contains(path)
+            || self.files.lock().unwrap().keys().any(|p| {
+                let prefix = format!("{path}/");
+                p.starts_with(&prefix)
+            })
     }
 
     /// Snapshot the current contents of `path`. Returns `None` if the file
@@ -155,11 +169,13 @@ impl smbserver::Filesystem for InMemoryFs {
         if let Some(data) = files.get(path) {
             return Ok(std::sync::Arc::new(MemFile { data: data.clone() }));
         }
-        // Otherwise treat as directory if it's the root or has any descendants.
+        // Otherwise treat as directory if it's the root, was explicitly
+        // created, or has any descendants.
         let is_root = path.is_empty();
         let prefix = if is_root { String::new() } else { format!("{path}/") };
         let has_children = files.keys().any(|p| p.starts_with(&prefix));
-        if is_root || has_children {
+        let explicitly_created = self.explicit_dirs.lock().unwrap().contains(path);
+        if is_root || has_children || explicitly_created {
             return Ok(std::sync::Arc::new(MemDir {
                 fs: self.clone(),
                 path: path.to_string(),
@@ -181,6 +197,23 @@ impl smbserver::Filesystem for InMemoryFs {
         Ok(std::sync::Arc::new(MemFile { data: entry.clone() }))
     }
 
+    fn create_dir(
+        &self,
+        path: &str,
+    ) -> std::io::Result<std::sync::Arc<dyn smbserver::FileHandle>> {
+        if self.files.lock().unwrap().contains_key(path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{path} exists as a file"),
+            ));
+        }
+        self.explicit_dirs.lock().unwrap().insert(path.to_string());
+        Ok(std::sync::Arc::new(MemDir {
+            fs: self.clone(),
+            path: path.to_string(),
+        }))
+    }
+
     fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
         let mut files = self.files.lock().unwrap();
         let data = files.remove(from).ok_or_else(|| {
@@ -199,16 +232,16 @@ impl smbserver::Filesystem for InMemoryFs {
     }
 
     fn delete(&self, path: &str) -> std::io::Result<()> {
-        let mut files = self.files.lock().unwrap();
-        files
-            .remove(path)
-            .map(|_| ())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("no such file: {path}"),
-                )
-            })
+        if self.files.lock().unwrap().remove(path).is_some() {
+            return Ok(());
+        }
+        if self.explicit_dirs.lock().unwrap().remove(path) {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no such file: {path}"),
+        ))
     }
 }
 
