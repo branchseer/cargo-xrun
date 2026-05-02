@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -36,7 +37,6 @@ pub struct Server {
 }
 
 struct Inner {
-    #[allow(dead_code)]
     fs: Box<dyn Filesystem>,
 }
 
@@ -54,6 +54,7 @@ impl Server {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        let mut conn = ConnectionState::new(self.inner.clone());
         loop {
             // SMB-over-TCP transport header: 1-byte zero + 24-bit big-endian length.
             let mut frame_header = [0u8; 4];
@@ -67,7 +68,7 @@ impl Server {
             let mut pdu = vec![0u8; pdu_len];
             io.read_exact(&mut pdu).await?;
 
-            let response = match self.handle_pdu(&pdu) {
+            let response = match conn.handle_pdu(&pdu) {
                 Some(bytes) => bytes,
                 None => return Ok(()), // unsupported command — close connection
             };
@@ -79,8 +80,34 @@ impl Server {
             io.write_all(&frame).await?;
         }
     }
+}
 
-    fn handle_pdu(&self, pdu: &[u8]) -> Option<Vec<u8>> {
+impl ServerBuilder {
+    pub fn build(self, fs: impl Filesystem) -> Server {
+        Server {
+            inner: Arc::new(Inner { fs: Box::new(fs) }),
+        }
+    }
+}
+
+/// Per-TCP-connection state. Holds the file handle table and any other
+/// state that lasts for the lifetime of one accepted socket.
+struct ConnectionState {
+    inner: Arc<Inner>,
+    open_files: HashMap<u64, Arc<dyn FileHandle>>,
+    next_file_id: u64,
+}
+
+impl ConnectionState {
+    fn new(inner: Arc<Inner>) -> Self {
+        Self {
+            inner,
+            open_files: HashMap::new(),
+            next_file_id: 1,
+        }
+    }
+
+    fn handle_pdu(&mut self, pdu: &[u8]) -> Option<Vec<u8>> {
         let mut cursor = Cursor::new(pdu);
         let request_header = Header::read(&mut cursor).ok()?;
 
@@ -92,7 +119,11 @@ impl Server {
         }
     }
 
-    fn handle_tree_connect(&self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+    fn handle_tree_connect(
+        &mut self,
+        request_header: Header,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Vec<u8> {
         let _ = TreeConnectRequest::read(cursor);
 
         let response_header = Header {
@@ -112,11 +143,11 @@ impl Server {
 
         let response_body = TreeConnectResponse {
             structure_size: 16,
-            share_type: 0x01, // DISK
+            share_type: 0x01,
             reserved: 0,
-            share_flags: 0x0000_0030, // NO_CACHING + AUTO_CACHING off (default)
+            share_flags: 0x0000_0030,
             capabilities: 0,
-            maximal_access: 0x001F_01FF, // FILE_ALL_ACCESS
+            maximal_access: 0x001F_01FF,
         };
 
         let mut bytes = Vec::with_capacity(64 + 16);
@@ -130,7 +161,11 @@ impl Server {
         bytes
     }
 
-    fn handle_session_setup(&self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+    fn handle_session_setup(
+        &mut self,
+        request_header: Header,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Vec<u8> {
         let request = SessionSetupRequest::read(cursor).ok();
         let is_authenticate = request
             .as_ref()
@@ -184,7 +219,7 @@ impl Server {
         bytes
     }
 
-    fn handle_negotiate(&self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+    fn handle_negotiate(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
         // Drain the request body so we faithfully exercise the parser even
         // though we don't use the values yet.
         let _ = NegotiateRequest::read(cursor);
@@ -229,13 +264,5 @@ impl Server {
             .write(&mut cursor)
             .expect("negotiate response serialize cannot fail");
         bytes
-    }
-}
-
-impl ServerBuilder {
-    pub fn build(self, fs: impl Filesystem) -> Server {
-        Server {
-            inner: Arc::new(Inner { fs: Box::new(fs) }),
-        }
     }
 }
