@@ -86,7 +86,17 @@ impl Server {
     }
 
     fn handle_session_setup(&self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
-        let _ = SessionSetupRequest::read(cursor);
+        let request = SessionSetupRequest::read(cursor).ok();
+        if let Some(req) = &request {
+            eprintln!(
+                "[smbserver] SESSION_SETUP request: {} bytes in security_buffer",
+                req.security_buffer.len()
+            );
+            for chunk in req.security_buffer.chunks(16) {
+                let hex: String = chunk.iter().map(|b| format!("{b:02X} ")).collect();
+                eprintln!("[smbserver]   {hex}");
+            }
+        }
 
         let session_id = if request_header.session_id == 0 {
             FIRST_SESSION_ID
