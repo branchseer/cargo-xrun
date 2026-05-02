@@ -309,6 +309,71 @@ fn marshal_dir_entries(entries: &[DirEntry]) -> Vec<u8> {
     buf
 }
 
+#[cfg(test)]
+mod glob_tests {
+    use super::glob_match;
+
+    #[test]
+    fn star_matches_anything() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn extension_pattern() {
+        assert!(glob_match("*.txt", "notes.txt"));
+        assert!(!glob_match("*.txt", "notes.bin"));
+    }
+
+    #[test]
+    fn question_mark_matches_one_char() {
+        assert!(glob_match("a?c", "abc"));
+        assert!(glob_match("a?c", "axc"));
+        assert!(!glob_match("a?c", "ac"));
+        assert!(!glob_match("a?c", "abbc"));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(glob_match("*.TXT", "notes.txt"));
+        assert!(glob_match("Hello*", "HELLO_world"));
+    }
+
+    #[test]
+    fn star_in_middle() {
+        assert!(glob_match("a*z", "abz"));
+        assert!(glob_match("a*z", "az"));
+        assert!(glob_match("a*z", "abcdefz"));
+        assert!(!glob_match("a*z", "abcd"));
+    }
+}
+
+/// Match a DOS-style glob `pattern` against `name`, case-insensitively.
+/// Wildcards: `*` matches any (possibly empty) sequence, `?` matches any
+/// single character. Used by QUERY_DIRECTORY filtering.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().flat_map(char::to_lowercase).collect();
+    let nm: Vec<char> = name.chars().flat_map(char::to_lowercase).collect();
+    glob_match_impl(&pat, &nm)
+}
+
+fn glob_match_impl(pattern: &[char], name: &[char]) -> bool {
+    match pattern.first() {
+        None => name.is_empty(),
+        Some('*') => {
+            // Try matching zero or more chars.
+            for i in 0..=name.len() {
+                if glob_match_impl(&pattern[1..], &name[i..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        Some('?') => !name.is_empty() && glob_match_impl(&pattern[1..], &name[1..]),
+        Some(&c) => name.first() == Some(&c) && glob_match_impl(&pattern[1..], &name[1..]),
+    }
+}
+
 /// Extract the share name from a TREE_CONNECT path like
 /// `\\server\share` or `\\server\share\subpath`. Returns `None` if the
 /// path is malformed (no share component).
@@ -630,6 +695,15 @@ impl ConnectionState {
             Ok(e) => e,
             Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
         };
+
+        let pattern = decode_utf16le(&request.file_name).ok();
+        let entries: Vec<DirEntry> = entries
+            .into_iter()
+            .filter(|e| match pattern.as_deref() {
+                None | Some("") | Some("*") => true,
+                Some(p) => glob_match(p, &e.name),
+            })
+            .collect();
 
         if entries.is_empty() {
             self.listed_dirs.insert(request.file_id_volatile);

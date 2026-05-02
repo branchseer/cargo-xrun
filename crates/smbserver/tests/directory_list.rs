@@ -73,6 +73,56 @@ async fn client_lists_root_directory() {
 
 #[tokio::test]
 #[ntest::timeout(5000)]
+async fn client_lists_with_glob_pattern_matches_extension() {
+    let mut fs = InMemoryFs::new();
+    fs.add_file("notes.txt", b"a".to_vec());
+    fs.add_file("readme.txt", b"b".to_vec());
+    fs.add_file("data.bin", b"c".to_vec());
+    fs.add_file("image.png", b"d".to_vec());
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = smbserver::Server::builder().share("public", fs).build();
+    let server_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve_connection(server_io).await;
+        })
+    };
+
+    let (conn, session, tree) =
+        connect_and_tree_connect(client_io, r"\\test-server\public").await;
+
+    let resource = tree
+        .create("", &open_existing_directory_args())
+        .await
+        .expect("open root failed");
+    let dir = std::sync::Arc::new(resource.unwrap_dir());
+
+    let names: Vec<String> = {
+        use futures_util::StreamExt;
+        let stream = smb::Directory::query::<FileBothDirectoryInformation>(&dir, "*.txt")
+            .await
+            .expect("QUERY_DIRECTORY *.txt failed");
+        futures_util::pin_mut!(stream);
+        let mut acc = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry.expect("entry decode failed");
+            acc.push(entry.file_name.to_string());
+        }
+        acc
+    };
+
+    assert_eq!(names, vec!["notes.txt".to_string(), "readme.txt".to_string()]);
+
+    drop(dir);
+    drop(tree);
+    drop(session);
+    drop(conn);
+    server_task.abort();
+}
+
+#[tokio::test]
+#[ntest::timeout(5000)]
 async fn client_lists_subdirectory() {
     let mut fs = InMemoryFs::new();
     fs.add_file("docs/readme.md", b"hi".to_vec());
