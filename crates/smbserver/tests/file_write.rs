@@ -3,7 +3,7 @@
 mod common;
 
 use common::{connect_and_tree_connect, InMemoryFs};
-use smb::WriteAt;
+use smb::{ReadAt, WriteAt};
 use smb_fscc::FileAccessMask;
 
 #[tokio::test]
@@ -53,6 +53,49 @@ async fn client_write_overwrites_existing_bytes() {
         fs_for_assert.snapshot("notes.txt").as_deref(),
         Some(b"Hello, SMB!!!".as_ref()),
     );
+}
+
+#[tokio::test]
+#[ntest::timeout(5000)]
+async fn client_reads_back_what_it_just_wrote() {
+    let mut fs = InMemoryFs::new();
+    fs.add_file("rw.txt", b"AAAAAAAA".to_vec());
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = smbserver::Server::builder().build(fs);
+    let server_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve_connection(server_io).await;
+        })
+    };
+
+    let (conn, session, tree) =
+        connect_and_tree_connect(client_io, r"\\test-server\public").await;
+
+    let resource = tree
+        .open_existing(
+            "rw.txt",
+            FileAccessMask::new()
+                .with_file_read_data(true)
+                .with_file_write_data(true),
+        )
+        .await
+        .expect("open rw.txt failed");
+    let file = resource.unwrap_file();
+
+    file.write_at(b"BBBB", 2).await.expect("WRITE failed");
+
+    let mut buf = vec![0u8; 8];
+    let n = file.read_at(&mut buf, 0).await.expect("READ failed");
+    buf.truncate(n);
+    assert_eq!(&buf, b"AABBBBAA");
+
+    drop(file);
+    drop(tree);
+    drop(session);
+    drop(conn);
+    server_task.abort();
 }
 
 #[tokio::test]

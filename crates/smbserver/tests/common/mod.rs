@@ -101,6 +101,7 @@ impl SmbTransportWrite for WriteHalfTransport {
     }
 }
 
+#[allow(dead_code)]
 pub struct NoFs;
 impl smbserver::Filesystem for NoFs {
     fn open(&self, _path: &str) -> std::io::Result<std::sync::Arc<dyn smbserver::FileHandle>> {
