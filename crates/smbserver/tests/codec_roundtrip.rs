@@ -1,7 +1,13 @@
-// Codec round-trip tests for SMB2 PDU types.
-//
-// One test per PDU type. Each test asserts: parse(serialize(value)) == value
-// for arbitrary values of that PDU. Property-based via `proptest` once it lands.
+//! Internal self-consistency checks for SMB2 PDU types.
+//!
+//! Each test asserts `parse(serialize(value)) == value` for a single value
+//! of one PDU type. Useful for catching bugs in `#[bw(calc = ...)]` /
+//! `#[br(temp)]` width or count mismatches.
+//!
+//! These tests do **not** validate spec-fidelity — wrong field order, wrong
+//! widths, wrong endianness all silently pass as long as the struct is
+//! internally consistent. For real validation against an interoperable
+//! implementation's bytes, see `tests/golden_smbrs.rs`.
 
 use std::io::Cursor;
 
