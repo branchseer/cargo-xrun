@@ -9,7 +9,7 @@ pub mod fs;
 pub mod ntlmssp;
 pub mod wire;
 
-pub use fs::{DirEntry, FileHandle, FileMetadata, Filesystem};
+pub use fs::{DirEntry, FileHandle, FileMetadata, Filesystem, VolumeInfo};
 
 use wire::close::{CloseRequest, CloseResponse};
 use wire::create::{CreateRequest, CreateResponse};
@@ -18,8 +18,9 @@ use wire::error::ErrorResponse;
 use wire::flush::{FlushRequest, FlushResponse};
 use wire::fscc::{
     FileBasicInformation, FileBothDirectoryInformation, FileDispositionInformation,
-    FileEndOfFileInformation, FileNetworkOpenInformation, FileRenameInformation,
-    FileStandardInformation,
+    FileEndOfFileInformation, FileFsAttributeInformation, FileFsFullSizeInformation,
+    FileFsSizeInformation, FileFsVolumeInformation, FileNetworkOpenInformation,
+    FileRenameInformation, FileStandardInformation,
 };
 use wire::header::Header;
 use wire::logoff::{LogoffRequest, LogoffResponse};
@@ -82,6 +83,12 @@ const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 /// QUERY_INFO/SET_INFO type codes. MS-SMB2 §2.2.37.
 const INFO_TYPE_FILE: u8 = 0x01;
+const INFO_TYPE_FILESYSTEM: u8 = 0x02;
+/// FileSystemInformationClass values. MS-FSCC §2.5.
+const FS_INFO_VOLUME: u8 = 1;
+const FS_INFO_SIZE: u8 = 3;
+const FS_INFO_ATTRIBUTE: u8 = 5;
+const FS_INFO_FULL_SIZE: u8 = 7;
 /// Common FileInformationClass values for QUERY_INFO. MS-FSCC §2.4.
 const FILE_INFO_BASIC: u8 = 4;
 const FILE_INFO_STANDARD: u8 = 5;
@@ -165,6 +172,70 @@ impl ServerBuilder {
             inner: Arc::new(Inner { shares: self.shares }),
         }
     }
+}
+
+/// Marshal a single QUERY_INFO type=FILESYSTEM response body for the
+/// requested FS info class.
+fn query_fs_info(volume: &VolumeInfo, class: u8) -> Result<Vec<u8>, u32> {
+    let label_utf16: Vec<u8> = volume
+        .label
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    let fs_name_utf16: Vec<u8> = volume
+        .fs_name
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+
+    let bytes_per_unit = volume.bytes_per_sector as u64 * volume.sectors_per_unit as u64;
+    let total_units = if bytes_per_unit == 0 {
+        0
+    } else {
+        volume.total_bytes / bytes_per_unit
+    };
+    let avail_units = if bytes_per_unit == 0 {
+        0
+    } else {
+        volume.available_bytes / bytes_per_unit
+    };
+
+    Ok(match class {
+        FS_INFO_VOLUME => serialize_body(&FileFsVolumeInformation {
+            volume_creation_time: 0,
+            volume_serial_number: volume.serial_number,
+            supports_objects: 0,
+            reserved: 0,
+            volume_label: label_utf16,
+        }),
+        FS_INFO_SIZE => serialize_body(&FileFsSizeInformation {
+            total_allocation_units: total_units,
+            available_allocation_units: avail_units,
+            sectors_per_allocation_unit: volume.sectors_per_unit,
+            bytes_per_sector: volume.bytes_per_sector,
+        }),
+        FS_INFO_FULL_SIZE => serialize_body(&FileFsFullSizeInformation {
+            total_allocation_units: total_units,
+            caller_available_allocation_units: avail_units,
+            actual_available_allocation_units: avail_units,
+            sectors_per_allocation_unit: volume.sectors_per_unit,
+            bytes_per_sector: volume.bytes_per_sector,
+        }),
+        FS_INFO_ATTRIBUTE => {
+            let mut attrs: u32 = 0x0000_0004 // CASE_PRESERVED_NAMES
+                | 0x0000_0040 // PERSISTENT_ACLS — neutral
+                | 0x0004_0000; // UNICODE_ON_DISK
+            if volume.case_sensitive {
+                attrs |= 0x0000_0001; // CASE_SENSITIVE_SEARCH
+            }
+            serialize_body(&FileFsAttributeInformation {
+                file_system_attributes: attrs,
+                maximum_component_name_length: volume.max_component_length as i32,
+                file_system_name: fs_name_utf16,
+            })
+        }
+        _ => return Err(STATUS_INVALID_INFO_CLASS),
+    })
 }
 
 /// Marshal a FileAllInformation (MS-FSCC §2.4.2): concatenation of
@@ -595,10 +666,42 @@ impl ConnectionState {
             None => return self.error_response(request_header, STATUS_FILE_CLOSED),
         };
 
-        if request.info_type != INFO_TYPE_FILE {
-            return self.error_response(request_header, STATUS_INVALID_INFO_CLASS);
-        }
+        let buffer = match request.info_type {
+            INFO_TYPE_FILE => match self.query_file_info(
+                &handle,
+                &path,
+                request.file_info_class,
+            ) {
+                Ok(b) => b,
+                Err(status) => return self.error_response(request_header, status),
+            },
+            INFO_TYPE_FILESYSTEM => {
+                let fs = match self.trees.get(&request_header.tree_id) {
+                    Some(fs) => fs.clone(),
+                    None => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+                };
+                match query_fs_info(&fs.volume_info(), request.file_info_class) {
+                    Ok(b) => b,
+                    Err(status) => return self.error_response(request_header, status),
+                }
+            }
+            _ => return self.error_response(request_header, STATUS_INVALID_INFO_CLASS),
+        };
 
+        let response_header = self.simple_response_header(&request_header, COMMAND_QUERY_INFO);
+        let response_body = QueryInfoResponse {
+            structure_size: 9,
+            output_buffer: buffer,
+        };
+        write_response(response_header, response_body, 0)
+    }
+
+    fn query_file_info(
+        &self,
+        handle: &Arc<dyn FileHandle>,
+        path: &str,
+        file_info_class: u8,
+    ) -> Result<Vec<u8>, u32> {
         let meta = handle.metadata();
         let attrs = if meta.is_directory {
             FILE_ATTRIBUTE_DIRECTORY
@@ -606,7 +709,7 @@ impl ConnectionState {
             FILE_ATTRIBUTE_NORMAL
         };
 
-        let buffer = match request.file_info_class {
+        Ok(match file_info_class {
             FILE_INFO_BASIC => serialize_body(&FileBasicInformation {
                 creation_time: meta.creation_time,
                 last_access_time: meta.last_access_time,
@@ -633,16 +736,9 @@ impl ConnectionState {
                 file_attributes: attrs,
                 reserved: 0,
             }),
-            FILE_INFO_ALL => marshal_file_all_information(&meta, attrs, &path),
-            _ => return self.error_response(request_header, STATUS_INVALID_INFO_CLASS),
-        };
-
-        let response_header = self.simple_response_header(&request_header, COMMAND_QUERY_INFO);
-        let response_body = QueryInfoResponse {
-            structure_size: 9,
-            output_buffer: buffer,
-        };
-        write_response(response_header, response_body, 0)
+            FILE_INFO_ALL => marshal_file_all_information(&meta, attrs, path),
+            _ => return Err(STATUS_INVALID_INFO_CLASS),
+        })
     }
 
     fn handle_tree_disconnect(

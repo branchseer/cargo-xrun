@@ -258,6 +258,20 @@ impl smbserver::Filesystem for InMemoryFs {
         Ok(())
     }
 
+    fn volume_info(&self) -> smbserver::VolumeInfo {
+        smbserver::VolumeInfo {
+            label: "InMemoryFs".to_string(),
+            serial_number: 0xDEAD_BEEF,
+            total_bytes: 1024 * 1024 * 1024,        // 1 GiB
+            available_bytes: 512 * 1024 * 1024,     // 512 MiB
+            bytes_per_sector: 512,
+            sectors_per_unit: 8,
+            fs_name: "InMemoryFs".to_string(),
+            case_sensitive: true,
+            max_component_length: 255,
+        }
+    }
+
     fn delete(&self, path: &str) -> std::io::Result<()> {
         if self.files.lock().unwrap().remove(path).is_some() {
             return Ok(());

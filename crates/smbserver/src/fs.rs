@@ -48,6 +48,46 @@ pub trait Filesystem: Send + Sync + 'static {
             "Filesystem does not support delete",
         ))
     }
+
+    /// Volume-level metadata returned in response to QUERY_INFO with
+    /// info_type = FILESYSTEM. Default returns reasonable placeholders.
+    fn volume_info(&self) -> VolumeInfo {
+        VolumeInfo::default()
+    }
+}
+
+/// Volume-level metadata for QUERY_INFO type = FILESYSTEM responses.
+#[derive(Debug, Clone)]
+pub struct VolumeInfo {
+    /// Volume label (UTF-8); marshalled as UTF-16LE on the wire.
+    pub label: String,
+    pub serial_number: u32,
+    /// Total bytes on the volume. Use `u64::MAX` for "unlimited".
+    pub total_bytes: u64,
+    /// Bytes still available for the caller to allocate.
+    pub available_bytes: u64,
+    pub bytes_per_sector: u32,
+    pub sectors_per_unit: u32,
+    /// Filesystem identifier shown to clients, e.g. "NTFS", "ext4".
+    pub fs_name: String,
+    pub case_sensitive: bool,
+    pub max_component_length: u32,
+}
+
+impl Default for VolumeInfo {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            serial_number: 0xDEAD_BEEF,
+            total_bytes: u64::MAX,
+            available_bytes: u64::MAX,
+            bytes_per_sector: 512,
+            sectors_per_unit: 8,
+            fs_name: "smbserver-rs".to_string(),
+            case_sensitive: false,
+            max_component_length: 255,
+        }
+    }
 }
 
 pub trait FileHandle: Send + Sync {
