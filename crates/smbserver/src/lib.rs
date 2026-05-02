@@ -11,6 +11,8 @@ pub mod wire;
 
 pub use fs::{FileHandle, Filesystem};
 
+use wire::create::{CreateRequest, CreateResponse};
+use wire::error::ErrorResponse;
 use wire::header::Header;
 use wire::negotiate::{NegotiateRequest, NegotiateResponse};
 use wire::session_setup::{SessionSetupRequest, SessionSetupResponse};
@@ -20,8 +22,16 @@ const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
 const COMMAND_NEGOTIATE: u16 = 0x0000;
 const COMMAND_SESSION_SETUP: u16 = 0x0001;
 const COMMAND_TREE_CONNECT: u16 = 0x0003;
+const COMMAND_CREATE: u16 = 0x0005;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// File attribute: regular file. MS-FSCC §2.6.
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+/// CREATE Action: existing file was opened. MS-SMB2 §2.2.14.
+const FILE_OPENED: u32 = 0x0000_0001;
 const DIALECT_SMB_2_1: u16 = 0x0210;
 /// First session id we hand out. SMB session ids must be non-zero.
 const FIRST_SESSION_ID: u64 = 0x1000_0000_0000_0001;
@@ -90,6 +100,15 @@ impl ServerBuilder {
     }
 }
 
+/// Decode a UTF-16LE byte buffer (as carried in SMB2 name fields) to UTF-8.
+fn decode_utf16le(bytes: &[u8]) -> Result<String, std::string::FromUtf16Error> {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(&units)
+}
+
 /// Per-TCP-connection state. Holds the file handle table and any other
 /// state that lasts for the lifetime of one accepted socket.
 struct ConnectionState {
@@ -115,8 +134,114 @@ impl ConnectionState {
             COMMAND_NEGOTIATE => Some(self.handle_negotiate(request_header, &mut cursor)),
             COMMAND_SESSION_SETUP => Some(self.handle_session_setup(request_header, &mut cursor)),
             COMMAND_TREE_CONNECT => Some(self.handle_tree_connect(request_header, &mut cursor)),
+            COMMAND_CREATE => Some(self.handle_create(request_header, &mut cursor)),
             _ => None,
         }
+    }
+
+    fn handle_create(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+        let request = match CreateRequest::read(cursor) {
+            Ok(r) => r,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        let path = match decode_utf16le(&request.name) {
+            Ok(p) => p,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        let handle = match self.inner.fs.open(&path) {
+            Ok(h) => h,
+            Err(e) => {
+                let status = match e.kind() {
+                    std::io::ErrorKind::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
+                    std::io::ErrorKind::PermissionDenied => STATUS_ACCESS_DENIED,
+                    _ => STATUS_INVALID_PARAMETER,
+                };
+                return self.error_response(request_header, status);
+            }
+        };
+
+        let file_id = self.next_file_id;
+        self.next_file_id += 1;
+        let size = handle.size();
+        self.open_files.insert(file_id, handle);
+
+        let response_header = Header {
+            structure_size: 64,
+            credit_charge: 0,
+            status: STATUS_SUCCESS,
+            command: COMMAND_CREATE,
+            credits: 1,
+            flags: SMB2_FLAGS_SERVER_TO_REDIR,
+            next_command: 0,
+            message_id: request_header.message_id,
+            reserved: 0,
+            tree_id: request_header.tree_id,
+            session_id: request_header.session_id,
+            signature: [0; 16],
+        };
+
+        let response_body = CreateResponse {
+            structure_size: 89,
+            oplock_level: 0,
+            flags: 0,
+            create_action: FILE_OPENED,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            allocation_size: size,
+            end_of_file: size,
+            file_attributes: FILE_ATTRIBUTE_NORMAL,
+            reserved2: 0,
+            file_id_persistent: file_id,
+            file_id_volatile: file_id,
+        };
+
+        let mut bytes = Vec::with_capacity(64 + 89);
+        let mut out = Cursor::new(&mut bytes);
+        response_header
+            .write(&mut out)
+            .expect("header serialize cannot fail");
+        response_body
+            .write(&mut out)
+            .expect("create response serialize cannot fail");
+        bytes
+    }
+
+    fn error_response(&self, request_header: Header, status: u32) -> Vec<u8> {
+        let response_header = Header {
+            structure_size: 64,
+            credit_charge: 0,
+            status,
+            command: request_header.command,
+            credits: 1,
+            flags: SMB2_FLAGS_SERVER_TO_REDIR,
+            next_command: 0,
+            message_id: request_header.message_id,
+            reserved: 0,
+            tree_id: request_header.tree_id,
+            session_id: request_header.session_id,
+            signature: [0; 16],
+        };
+
+        let response_body = ErrorResponse {
+            structure_size: 9,
+            error_context_count: 0,
+            reserved: 0,
+            error_data: vec![0],
+        };
+
+        let mut bytes = Vec::with_capacity(64 + 9);
+        let mut out = Cursor::new(&mut bytes);
+        response_header
+            .write(&mut out)
+            .expect("header serialize cannot fail");
+        response_body
+            .write(&mut out)
+            .expect("error response serialize cannot fail");
+        bytes
     }
 
     fn handle_tree_connect(
