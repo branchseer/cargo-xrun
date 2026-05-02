@@ -50,6 +50,51 @@ async fn query_standard_info_reports_correct_size() {
 
 #[tokio::test]
 #[ntest::timeout(5000)]
+async fn query_basic_info_returns_timestamps_set_by_filesystem() {
+    let mut fs = InMemoryFs::new();
+    // 2024-06-15 12:34:56 UTC in FILETIME (100ns ticks since 1601-01-01).
+    let created = 0x01DAB_F8B6_2BAC_E000_u64;
+    let modified = created + 60 * 10_000_000; // +6 seconds × 10^7 ticks
+    fs.add_file_with_timestamps("dated.txt", b"hi".to_vec(), created, modified);
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = smbserver::Server::builder().share("public", fs).build();
+    let server_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve_connection(server_io).await;
+        })
+    };
+
+    let (conn, session, tree) =
+        connect_and_tree_connect(client_io, r"\\test-server\public").await;
+
+    let resource = tree
+        .open_existing(
+            "dated.txt",
+            FileAccessMask::new().with_file_read_attributes(true),
+        )
+        .await
+        .expect("open dated.txt failed");
+    let file = resource.unwrap_file();
+
+    let info: FileBasicInformation = file
+        .handle()
+        .query_info()
+        .await
+        .expect("QUERY_INFO Basic failed");
+    assert_eq!(info.creation_time.since_epoch().as_nanos(), created as u128 * 100);
+    assert_eq!(info.last_write_time.since_epoch().as_nanos(), modified as u128 * 100);
+
+    drop(file);
+    drop(tree);
+    drop(session);
+    drop(conn);
+    server_task.abort();
+}
+
+#[tokio::test]
+#[ntest::timeout(5000)]
 async fn query_basic_info_reports_normal_attributes_for_file() {
     let mut fs = InMemoryFs::new();
     fs.add_file("file.txt", b"hi".to_vec());

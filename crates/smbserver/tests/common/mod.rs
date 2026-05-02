@@ -112,6 +112,13 @@ impl smbserver::Filesystem for NoFs {
     }
 }
 
+/// File entry in the InMemoryFs map: shared content + per-entry metadata.
+struct FileEntry {
+    data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    created_at: u64,
+    modified_at: u64,
+}
+
 /// In-memory filesystem for tests. Files are pre-populated; opens look up
 /// by exact path match. Writes are visible across handles to the same path.
 ///
@@ -119,11 +126,7 @@ impl smbserver::Filesystem for NoFs {
 /// by `add_directory` and `create_dir` (so empty directories can exist).
 #[derive(Default, Clone)]
 pub struct InMemoryFs {
-    files: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
-        >,
-    >,
+    files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, FileEntry>>>,
     explicit_dirs: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
@@ -133,12 +136,26 @@ impl InMemoryFs {
     }
 
     pub fn add_file(&mut self, path: impl Into<String>, content: impl Into<Vec<u8>>) {
-        let path = path.into();
-        let content = content.into();
-        self.files
-            .lock()
-            .unwrap()
-            .insert(path, std::sync::Arc::new(std::sync::Mutex::new(content)));
+        self.add_file_with_timestamps(path, content, 0, 0);
+    }
+
+    /// Like `add_file` but with explicit FILETIME timestamps. Useful for
+    /// QUERY_INFO tests that assert non-zero values on the wire.
+    pub fn add_file_with_timestamps(
+        &mut self,
+        path: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+        created_at: u64,
+        modified_at: u64,
+    ) {
+        self.files.lock().unwrap().insert(
+            path.into(),
+            FileEntry {
+                data: std::sync::Arc::new(std::sync::Mutex::new(content.into())),
+                created_at,
+                modified_at,
+            },
+        );
     }
 
     /// Mark `path` as an existing directory. Lets tests assert clients can
@@ -158,7 +175,7 @@ impl InMemoryFs {
             .lock()
             .unwrap()
             .get(path)
-            .map(|data| data.lock().unwrap().clone())
+            .map(|entry| entry.data.lock().unwrap().clone())
     }
 }
 
@@ -166,8 +183,12 @@ impl smbserver::Filesystem for InMemoryFs {
     fn open(&self, path: &str) -> std::io::Result<std::sync::Arc<dyn smbserver::FileHandle>> {
         let files = self.files.lock().unwrap();
         // File match wins.
-        if let Some(data) = files.get(path) {
-            return Ok(std::sync::Arc::new(MemFile { data: data.clone() }));
+        if let Some(entry) = files.get(path) {
+            return Ok(std::sync::Arc::new(MemFile {
+                data: entry.data.clone(),
+                created_at: entry.created_at,
+                modified_at: entry.modified_at,
+            }));
         }
         // Otherwise treat as directory if it's the root, was explicitly
         // created, or has any descendants.
@@ -189,12 +210,18 @@ impl smbserver::Filesystem for InMemoryFs {
 
     fn create(&self, path: &str) -> std::io::Result<std::sync::Arc<dyn smbserver::FileHandle>> {
         let mut files = self.files.lock().unwrap();
-        let entry = files
-            .entry(path.to_string())
-            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let entry = files.entry(path.to_string()).or_insert_with(|| FileEntry {
+            data: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            created_at: 0,
+            modified_at: 0,
+        });
         // Replace contents — SUPERSEDE/OVERWRITE_IF semantics.
-        entry.lock().unwrap().clear();
-        Ok(std::sync::Arc::new(MemFile { data: entry.clone() }))
+        entry.data.lock().unwrap().clear();
+        Ok(std::sync::Arc::new(MemFile {
+            data: entry.data.clone(),
+            created_at: entry.created_at,
+            modified_at: entry.modified_at,
+        }))
     }
 
     fn create_dir(
@@ -255,7 +282,7 @@ impl InMemoryFs {
         };
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut entries = Vec::new();
-        for (path, data) in files.iter() {
+        for (path, entry) in files.iter() {
             if !path.starts_with(&prefix) {
                 continue;
             }
@@ -278,7 +305,7 @@ impl InMemoryFs {
                     if seen.insert(rest.to_string()) {
                         entries.push(smbserver::DirEntry {
                             name: rest.to_string(),
-                            size: data.lock().unwrap().len() as u64,
+                            size: entry.data.lock().unwrap().len() as u64,
                             is_dir: false,
                         });
                     }
@@ -310,11 +337,26 @@ impl smbserver::FileHandle for MemDir {
 
 struct MemFile {
     data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    created_at: u64,
+    modified_at: u64,
 }
 
 impl smbserver::FileHandle for MemFile {
     fn size(&self) -> u64 {
         self.data.lock().unwrap().len() as u64
+    }
+
+    fn metadata(&self) -> smbserver::FileMetadata {
+        let size = self.data.lock().unwrap().len() as u64;
+        smbserver::FileMetadata {
+            size,
+            allocation_size: size,
+            creation_time: self.created_at,
+            last_access_time: self.modified_at,
+            last_write_time: self.modified_at,
+            change_time: self.modified_at,
+            is_directory: false,
+        }
     }
 
     fn read(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
