@@ -112,10 +112,14 @@ impl smbserver::Filesystem for NoFs {
 }
 
 /// In-memory filesystem for tests. Files are pre-populated; opens look up
-/// by exact path match.
-#[derive(Default)]
+/// by exact path match. Writes are visible across handles to the same path.
+#[derive(Default, Clone)]
 pub struct InMemoryFs {
-    files: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
+    files: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+        >,
+    >,
 }
 
 impl InMemoryFs {
@@ -124,13 +128,28 @@ impl InMemoryFs {
     }
 
     pub fn add_file(&mut self, path: impl Into<String>, content: impl Into<Vec<u8>>) {
-        self.files.insert(path.into(), std::sync::Arc::new(content.into()));
+        let path = path.into();
+        let content = content.into();
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path, std::sync::Arc::new(std::sync::Mutex::new(content)));
+    }
+
+    /// Snapshot the current contents of `path`. Returns `None` if the file
+    /// does not exist. Useful for asserting writes landed.
+    pub fn snapshot(&self, path: &str) -> Option<Vec<u8>> {
+        self.files
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|data| data.lock().unwrap().clone())
     }
 }
 
 impl smbserver::Filesystem for InMemoryFs {
     fn open(&self, path: &str) -> std::io::Result<std::sync::Arc<dyn smbserver::FileHandle>> {
-        match self.files.get(path) {
+        match self.files.lock().unwrap().get(path) {
             Some(data) => Ok(std::sync::Arc::new(MemFile { data: data.clone() })),
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -141,21 +160,33 @@ impl smbserver::Filesystem for InMemoryFs {
 }
 
 struct MemFile {
-    data: std::sync::Arc<Vec<u8>>,
+    data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl smbserver::FileHandle for MemFile {
     fn size(&self) -> u64 {
-        self.data.len() as u64
+        self.data.lock().unwrap().len() as u64
     }
 
     fn read(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
+        let data = self.data.lock().unwrap();
         let start = offset as usize;
-        if start >= self.data.len() {
+        if start >= data.len() {
             return Ok(Vec::new());
         }
-        let end = (start + len as usize).min(self.data.len());
-        Ok(self.data[start..end].to_vec())
+        let end = (start + len as usize).min(data.len());
+        Ok(data[start..end].to_vec())
+    }
+
+    fn write(&self, offset: u64, payload: &[u8]) -> std::io::Result<u32> {
+        let mut data = self.data.lock().unwrap();
+        let start = offset as usize;
+        let end = start + payload.len();
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        data[start..end].copy_from_slice(payload);
+        Ok(payload.len() as u32)
     }
 }
 

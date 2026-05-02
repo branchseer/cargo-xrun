@@ -19,6 +19,7 @@ use wire::negotiate::{NegotiateRequest, NegotiateResponse};
 use wire::read::{ReadRequest, ReadResponse};
 use wire::session_setup::{SessionSetupRequest, SessionSetupResponse};
 use wire::tree_connect::{TreeConnectRequest, TreeConnectResponse};
+use wire::write::{WriteRequest, WriteResponse};
 
 const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
 const COMMAND_NEGOTIATE: u16 = 0x0000;
@@ -27,6 +28,7 @@ const COMMAND_TREE_CONNECT: u16 = 0x0003;
 const COMMAND_CREATE: u16 = 0x0005;
 const COMMAND_CLOSE: u16 = 0x0006;
 const COMMAND_READ: u16 = 0x0008;
+const COMMAND_WRITE: u16 = 0x0009;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -143,8 +145,67 @@ impl ConnectionState {
             COMMAND_CREATE => Some(self.handle_create(request_header, &mut cursor)),
             COMMAND_CLOSE => Some(self.handle_close(request_header, &mut cursor)),
             COMMAND_READ => Some(self.handle_read(request_header, &mut cursor)),
+            COMMAND_WRITE => Some(self.handle_write(request_header, &mut cursor)),
             _ => None,
         }
+    }
+
+    fn handle_write(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
+        let request = match WriteRequest::read(cursor) {
+            Ok(r) => r,
+            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+        };
+
+        let handle = match self.open_files.get(&request.file_id_volatile) {
+            Some(h) => h.clone(),
+            None => return self.error_response(request_header, STATUS_FILE_CLOSED),
+        };
+
+        let written = match handle.write(request.offset, &request.data) {
+            Ok(n) => n,
+            Err(e) => {
+                let status = match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => STATUS_ACCESS_DENIED,
+                    std::io::ErrorKind::Unsupported => STATUS_ACCESS_DENIED,
+                    _ => STATUS_INVALID_PARAMETER,
+                };
+                return self.error_response(request_header, status);
+            }
+        };
+
+        let response_header = Header {
+            structure_size: 64,
+            credit_charge: 0,
+            status: STATUS_SUCCESS,
+            command: COMMAND_WRITE,
+            credits: 1,
+            flags: SMB2_FLAGS_SERVER_TO_REDIR,
+            next_command: 0,
+            message_id: request_header.message_id,
+            reserved: 0,
+            tree_id: request_header.tree_id,
+            session_id: request_header.session_id,
+            signature: [0; 16],
+        };
+
+        let response_body = WriteResponse {
+            structure_size: 17,
+            reserved: 0,
+            count: written,
+            remaining: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+        };
+
+        let mut bytes = Vec::with_capacity(64 + 17);
+        let mut out = Cursor::new(&mut bytes);
+        response_header
+            .write(&mut out)
+            .expect("header serialize cannot fail");
+        response_body
+            .write(&mut out)
+            .expect("write response serialize cannot fail");
+        bytes
     }
 
     fn handle_read(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {

@@ -22,4 +22,16 @@ pub trait FileHandle: Send + Sync {
     /// Read up to `len` bytes starting at `offset`. Returns fewer bytes
     /// than requested only at end-of-file.
     fn read(&self, offset: u64, len: u32) -> io::Result<Vec<u8>>;
+
+    /// Write `data` at `offset`, extending the file as needed. Returns
+    /// the number of bytes accepted (typically `data.len()`).
+    ///
+    /// Default impl rejects all writes with `ErrorKind::Unsupported`,
+    /// matching the read-only default of pre-existing handles.
+    fn write(&self, _offset: u64, _data: &[u8]) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "FileHandle is read-only",
+        ))
+    }
 }
