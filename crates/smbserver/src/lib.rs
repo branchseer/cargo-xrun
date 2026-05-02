@@ -4,6 +4,7 @@ use std::sync::Arc;
 use binrw::{BinRead, BinWrite};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod ntlmssp;
 pub mod wire;
 
 use wire::header::Header;
@@ -122,7 +123,7 @@ impl Server {
         let response_body = SessionSetupResponse {
             structure_size: 9,
             session_flags: 0,
-            security_buffer: vec![],
+            security_buffer: ntlmssp::challenge_message(),
         };
 
         let mut bytes = Vec::with_capacity(64 + 9);
