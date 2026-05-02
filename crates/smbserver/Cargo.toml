@@ -9,6 +9,7 @@ tokio = { version = "1.48", features = ["io-util", "rt"] }
 
 [dev-dependencies]
 smb = { version = "0.11", default-features = false, features = ["async", "sign", "encrypt"] }
+smb-fscc = "0.11"
 smb-transport = { version = "0.11", default-features = false, features = ["async"] }
 futures-core = "0.3"
 futures-util = "0.3"

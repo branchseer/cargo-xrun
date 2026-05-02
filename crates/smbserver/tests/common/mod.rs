@@ -110,3 +110,94 @@ impl smbserver::Filesystem for NoFs {
         ))
     }
 }
+
+/// In-memory filesystem for tests. Files are pre-populated; opens look up
+/// by exact path match.
+#[derive(Default)]
+pub struct InMemoryFs {
+    files: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
+}
+
+impl InMemoryFs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_file(&mut self, path: impl Into<String>, content: impl Into<Vec<u8>>) {
+        self.files.insert(path.into(), std::sync::Arc::new(content.into()));
+    }
+}
+
+impl smbserver::Filesystem for InMemoryFs {
+    fn open(&self, path: &str) -> std::io::Result<std::sync::Arc<dyn smbserver::FileHandle>> {
+        match self.files.get(path) {
+            Some(data) => Ok(std::sync::Arc::new(MemFile { data: data.clone() })),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no such file: {path}"),
+            )),
+        }
+    }
+}
+
+struct MemFile {
+    data: std::sync::Arc<Vec<u8>>,
+}
+
+impl smbserver::FileHandle for MemFile {
+    fn size(&self) -> u64 {
+        self.data.len() as u64
+    }
+
+    fn read(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
+        let start = offset as usize;
+        if start >= self.data.len() {
+            return Ok(Vec::new());
+        }
+        let end = (start + len as usize).min(self.data.len());
+        Ok(self.data[start..end].to_vec())
+    }
+}
+
+/// Standard guest credentials used by test setups.
+pub fn guest_identity() -> sspi::AuthIdentity {
+    sspi::AuthIdentity {
+        username: sspi::Username::parse("guest").expect("valid username"),
+        password: sspi::Secret::from(String::new()),
+    }
+}
+
+/// Drive smb-rs through NEGOTIATE + SESSION_SETUP + TREE_CONNECT and
+/// hand back the connected Tree.
+pub async fn connect_and_tree_connect(
+    client_io: tokio::io::DuplexStream,
+    share_path: &str,
+) -> (smb::Connection, smb::Session, smb::Tree) {
+    let transport = Box::new(DuplexTransport::new(client_io));
+    let config = smb::ConnectionConfig {
+        smb2_only_negotiate: true,
+        allow_unsigned_guest_access: true,
+        ..smb::ConnectionConfig::default()
+    };
+    let conn = smb::Connection::from_transport(
+        transport,
+        "test-server",
+        smb::Guid::generate(),
+        config,
+    )
+    .await
+    .expect("NEGOTIATE failed");
+    let session = conn
+        .authenticate(guest_identity())
+        .await
+        .expect("SESSION_SETUP failed");
+    let target =
+        smb::UncPath::from_str(share_path).expect("valid UNC path");
+    let tree = session
+        .tree_connect(&target)
+        .await
+        .expect("TREE_CONNECT failed");
+    (conn, session, tree)
+}
+
+use std::str::FromStr;
