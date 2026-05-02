@@ -12,6 +12,17 @@ pub trait Filesystem: Send + Sync + 'static {
     /// Path components are UTF-8; the server has already decoded the
     /// UTF-16LE sent on the wire.
     fn open(&self, path: &str) -> io::Result<Arc<dyn FileHandle>>;
+
+    /// Create a new file at `path` and return a handle to it.
+    ///
+    /// Default impl rejects all creates with `ErrorKind::Unsupported`,
+    /// preserving the read-only contract for existing implementations.
+    fn create(&self, _path: &str) -> io::Result<Arc<dyn FileHandle>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem is read-only",
+        ))
+    }
 }
 
 pub trait FileHandle: Send + Sync {

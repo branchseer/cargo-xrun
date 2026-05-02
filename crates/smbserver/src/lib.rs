@@ -48,6 +48,17 @@ const QUERY_DIR_FLAG_RESTART_SCANS: u8 = 0x01;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 /// CREATE Action: existing file was opened. MS-SMB2 §2.2.14.
 const FILE_OPENED: u32 = 0x0000_0001;
+/// CREATE Action: new file was created. MS-SMB2 §2.2.14.
+const FILE_CREATED: u32 = 0x0000_0002;
+/// CREATE Disposition values. MS-SMB2 §2.2.13.
+const FILE_DISP_SUPERSEDE: u32 = 0x0000_0000;
+const FILE_DISP_OPEN: u32 = 0x0000_0001;
+const FILE_DISP_CREATE: u32 = 0x0000_0002;
+const FILE_DISP_OPEN_IF: u32 = 0x0000_0003;
+const FILE_DISP_OVERWRITE: u32 = 0x0000_0004;
+const FILE_DISP_OVERWRITE_IF: u32 = 0x0000_0005;
+/// Status returned for CREATE Create disposition when target exists.
+const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 const DIALECT_SMB_2_1: u16 = 0x0210;
 /// First session id we hand out. SMB session ids must be non-zero.
 const FIRST_SESSION_ID: u64 = 0x1000_0000_0000_0001;
@@ -113,6 +124,59 @@ impl ServerBuilder {
         Server {
             inner: Arc::new(Inner { fs: Box::new(fs) }),
         }
+    }
+}
+
+/// Resolve an SMB CREATE disposition into Filesystem ops, returning the
+/// resulting handle and the `create_action` value to report to the client.
+fn dispatch_create(
+    fs: &dyn Filesystem,
+    path: &str,
+    disposition: u32,
+) -> Result<(Arc<dyn FileHandle>, u32), u32> {
+    match disposition {
+        FILE_DISP_OPEN => fs
+            .open(path)
+            .map(|h| (h, FILE_OPENED))
+            .map_err(map_io_err),
+        FILE_DISP_CREATE => match fs.open(path) {
+            Ok(_) => Err(STATUS_OBJECT_NAME_COLLISION),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs
+                .create(path)
+                .map(|h| (h, FILE_CREATED))
+                .map_err(map_io_err),
+            Err(e) => Err(map_io_err(e)),
+        },
+        FILE_DISP_OPEN_IF => match fs.open(path) {
+            Ok(h) => Ok((h, FILE_OPENED)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs
+                .create(path)
+                .map(|h| (h, FILE_CREATED))
+                .map_err(map_io_err),
+            Err(e) => Err(map_io_err(e)),
+        },
+        FILE_DISP_SUPERSEDE | FILE_DISP_OVERWRITE_IF => match fs.create(path) {
+            Ok(h) => Ok((h, FILE_CREATED)),
+            Err(e) => Err(map_io_err(e)),
+        },
+        FILE_DISP_OVERWRITE => match fs.open(path) {
+            Ok(_) => fs
+                .create(path)
+                .map(|h| (h, FILE_CREATED))
+                .map_err(map_io_err),
+            Err(e) => Err(map_io_err(e)),
+        },
+        _ => Err(STATUS_INVALID_PARAMETER),
+    }
+}
+
+fn map_io_err(e: std::io::Error) -> u32 {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
+        std::io::ErrorKind::PermissionDenied => STATUS_ACCESS_DENIED,
+        std::io::ErrorKind::Unsupported => STATUS_ACCESS_DENIED,
+        std::io::ErrorKind::AlreadyExists => STATUS_OBJECT_NAME_COLLISION,
+        _ => STATUS_INVALID_PARAMETER,
     }
 }
 
@@ -463,16 +527,13 @@ impl ConnectionState {
             Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
         };
 
-        let handle = match self.inner.fs.open(&path) {
-            Ok(h) => h,
-            Err(e) => {
-                let status = match e.kind() {
-                    std::io::ErrorKind::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
-                    std::io::ErrorKind::PermissionDenied => STATUS_ACCESS_DENIED,
-                    _ => STATUS_INVALID_PARAMETER,
-                };
-                return self.error_response(request_header, status);
-            }
+        let (handle, action) = match dispatch_create(
+            &*self.inner.fs,
+            &path,
+            request.create_disposition,
+        ) {
+            Ok(t) => t,
+            Err(status) => return self.error_response(request_header, status),
         };
 
         let file_id = self.next_file_id;
@@ -504,7 +565,7 @@ impl ConnectionState {
             structure_size: 89,
             oplock_level: 0,
             flags: 0,
-            create_action: FILE_OPENED,
+            create_action: action,
             creation_time: 0,
             last_access_time: 0,
             last_write_time: 0,

@@ -170,6 +170,16 @@ impl smbserver::Filesystem for InMemoryFs {
             format!("no such path: {path}"),
         ))
     }
+
+    fn create(&self, path: &str) -> std::io::Result<std::sync::Arc<dyn smbserver::FileHandle>> {
+        let mut files = self.files.lock().unwrap();
+        let entry = files
+            .entry(path.to_string())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        // Replace contents — SUPERSEDE/OVERWRITE_IF semantics.
+        entry.lock().unwrap().clear();
+        Ok(std::sync::Arc::new(MemFile { data: entry.clone() }))
+    }
 }
 
 impl InMemoryFs {
