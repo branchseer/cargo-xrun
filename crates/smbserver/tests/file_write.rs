@@ -100,6 +100,54 @@ async fn client_reads_back_what_it_just_wrote() {
 
 #[tokio::test]
 #[ntest::timeout(5000)]
+async fn client_writes_payload_larger_than_max_write_size() {
+    // 200 KiB; server advertises max_write_size = 64 KiB so smb-rs splits.
+    let payload: Vec<u8> = (0..(200 * 1024))
+        .map(|i| ((i * 7) % 251) as u8)
+        .collect();
+    let mut fs = InMemoryFs::new();
+    fs.add_file("dest.bin", Vec::new());
+    let fs_for_assert = fs.clone();
+
+    let (client_io, server_io) = tokio::io::duplex(512 * 1024);
+    let server = smbserver::Server::builder().share("public", fs).build();
+    let server_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve_connection(server_io).await;
+        })
+    };
+
+    let (conn, session, tree) =
+        connect_and_tree_connect(client_io, r"\\test-server\public").await;
+
+    let resource = tree
+        .open_existing(
+            "dest.bin",
+            FileAccessMask::new()
+                .with_file_read_data(true)
+                .with_file_write_data(true),
+        )
+        .await
+        .expect("open dest.bin failed");
+    let file = resource.unwrap_file();
+
+    let n = file.write_at(&payload, 0).await.expect("WRITE failed");
+    assert_eq!(n as usize, payload.len());
+
+    drop(file);
+    drop(tree);
+    drop(session);
+    drop(conn);
+    server_task.abort();
+
+    let snap = fs_for_assert.snapshot("dest.bin").expect("file exists");
+    assert_eq!(snap.len(), payload.len());
+    assert_eq!(snap, payload);
+}
+
+#[tokio::test]
+#[ntest::timeout(5000)]
 async fn client_write_extends_file_past_eof() {
     let mut fs = InMemoryFs::new();
     fs.add_file("growing.bin", b"abc".to_vec());
