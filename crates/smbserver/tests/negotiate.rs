@@ -2,12 +2,8 @@
 //!
 //! Hermetic: client and server are wired together via a single
 //! `tokio::io::duplex` pipe. No sockets, no listener, no port races.
-//!
-//! Currently fails by timeout — `smbserver::serve` is a stub. When
-//! NEGOTIATE is implemented, this test should pass within a second.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
@@ -114,7 +110,8 @@ impl SmbTransportWrite for WriteHalfTransport {
 struct NoFs;
 impl smbserver::Filesystem for NoFs {}
 
-#[test_log::test(tokio::test)]
+#[tokio::test]
+#[ntest::timeout(3000)]
 async fn client_negotiates_smb2() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
@@ -132,16 +129,10 @@ async fn client_negotiates_smb2() {
         ..Default::default()
     };
 
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(3),
-        Connection::from_transport(transport, "test-server", Guid::generate(), config),
-    )
-    .await;
+    let conn = Connection::from_transport(transport, "test-server", Guid::generate(), config)
+        .await
+        .expect("NEGOTIATE returned an error");
 
     server_task.abort();
-
-    let conn = outcome
-        .expect("client did not finish NEGOTIATE within 3s — server did not reply")
-        .expect("NEGOTIATE returned an error");
     drop(conn);
 }
