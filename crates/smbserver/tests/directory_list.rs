@@ -123,6 +123,64 @@ async fn client_lists_with_glob_pattern_matches_extension() {
 
 #[tokio::test]
 #[ntest::timeout(5000)]
+async fn large_directory_paginates_across_multiple_round_trips() {
+    let mut fs = InMemoryFs::new();
+    // 200 entries with reasonably long names — far more than fits in
+    // a small client-supplied buffer in one round-trip.
+    for i in 0..200 {
+        fs.add_file(format!("file_{i:04}.bin"), vec![0u8; 1]);
+    }
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = smbserver::Server::builder().share("public", fs).build();
+    let server_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve_connection(server_io).await;
+        })
+    };
+
+    let (conn, session, tree) =
+        connect_and_tree_connect(client_io, r"\\test-server\public").await;
+
+    let resource = tree
+        .create("", &open_existing_directory_args())
+        .await
+        .expect("open root failed");
+    let dir = std::sync::Arc::new(resource.unwrap_dir());
+
+    // Use the Directory::query_with_options API so we can pass a small
+    // buffer and force the server to paginate.
+    let names: Vec<String> = {
+        use futures_util::StreamExt;
+        let stream = smb::Directory::query_with_options::<FileBothDirectoryInformation>(
+            &dir, "*", 4096,
+        )
+        .await
+        .expect("QUERY_DIRECTORY failed");
+        futures_util::pin_mut!(stream);
+        let mut acc = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry.expect("entry decode failed");
+            acc.push(entry.file_name.to_string());
+        }
+        acc
+    };
+
+    assert_eq!(names.len(), 200);
+    // Names come back sorted (InMemoryFs::list_internal sorts).
+    assert_eq!(names[0], "file_0000.bin");
+    assert_eq!(names[199], "file_0199.bin");
+
+    drop(dir);
+    drop(tree);
+    drop(session);
+    drop(conn);
+    server_task.abort();
+}
+
+#[tokio::test]
+#[ntest::timeout(5000)]
 async fn client_lists_subdirectory() {
     let mut fs = InMemoryFs::new();
     fs.add_file("docs/readme.md", b"hi".to_vec());

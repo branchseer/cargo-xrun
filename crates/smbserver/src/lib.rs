@@ -38,7 +38,7 @@
 //! is suitable for testing and trusted networks; do not expose to the
 //! public internet.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -126,6 +126,15 @@ const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
 /// Client opened a file but the path resolved to a directory.
 const STATUS_FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
+/// Generic "operation not supported" — returned for commands we don't
+/// implement so the client can move on instead of seeing the connection close.
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+/// One of the parent directories in the path doesn't exist.
+const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+/// Returned in response to CANCEL'd operations.
+const STATUS_CANCELLED: u32 = 0xC000_0120;
+/// QUERY_DIRECTORY: caller's output buffer can't hold even one entry.
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 /// QUERY_INFO/SET_INFO type codes. MS-SMB2 §2.2.37.
 const INFO_TYPE_FILE: u8 = 0x01;
 const INFO_TYPE_FILESYSTEM: u8 = 0x02;
@@ -192,7 +201,7 @@ impl Server {
 
             let response = match conn.handle_pdu(&pdu) {
                 Some(bytes) => bytes,
-                None => return Ok(()), // unsupported command — close connection
+                None => return Ok(()), // malformed header — close
             };
 
             let len = response.len() as u32;
@@ -414,6 +423,15 @@ fn map_io_err(e: std::io::Error) -> u32 {
     }
 }
 
+/// Wire size in bytes of a single FILE_BOTH_DIR_INFORMATION record
+/// for the given entry, including 8-byte alignment padding to the next
+/// entry. Used by the QUERY_DIRECTORY pagination loop.
+fn file_both_dir_entry_wire_size(entry: &DirEntry) -> usize {
+    let name_bytes = entry.name.encode_utf16().count() * 2;
+    let raw = 94 + name_bytes; // fixed prefix per MS-FSCC §2.4.8
+    (raw + 7) & !7
+}
+
 /// Marshal a list of `DirEntry` as a chain of FILE_BOTH_DIR_INFORMATION
 /// records, each padded to an 8-byte boundary, with `next_entry_offset`
 /// patched to the byte distance to the next entry (0 for the last).
@@ -571,9 +589,11 @@ struct ConnectionState {
     inner: Arc<Inner>,
     open_files: HashMap<u64, OpenFile>,
     next_file_id: u64,
-    /// FileIds whose directory listing has been fully delivered. Cleared
-    /// when the client sends QUERY_DIRECTORY with the RESTART_SCANS flag.
-    listed_dirs: HashSet<u64>,
+    /// Per-FileId queue of directory entries still to deliver. Each
+    /// QUERY_DIRECTORY peels entries from the front until the client's
+    /// output buffer would overflow; emptying the queue ends iteration
+    /// with STATUS_NO_MORE_FILES. Cleared by RESTART_SCANS.
+    pending_listings: HashMap<u64, VecDeque<DirEntry>>,
     /// TreeId → backing filesystem for that share. Populated on
     /// TREE_CONNECT, cleared on TREE_DISCONNECT.
     trees: HashMap<u32, Arc<dyn Filesystem>>,
@@ -586,7 +606,7 @@ impl ConnectionState {
             inner,
             open_files: HashMap::new(),
             next_file_id: 1,
-            listed_dirs: HashSet::new(),
+            pending_listings: HashMap::new(),
             trees: HashMap::new(),
             next_tree_id: 1,
         }
@@ -594,29 +614,30 @@ impl ConnectionState {
 
     fn handle_pdu(&mut self, pdu: &[u8]) -> Option<Vec<u8>> {
         let mut cursor = Cursor::new(pdu);
-        let request_header = Header::read(&mut cursor).ok()?;
+        let request_header = match Header::read(&mut cursor) {
+            Ok(h) => h,
+            // Malformed header — close the connection rather than try to reply
+            // (no MessageId means no valid response).
+            Err(_) => return None,
+        };
 
-        match request_header.command {
-            COMMAND_NEGOTIATE => Some(self.handle_negotiate(request_header, &mut cursor)),
-            COMMAND_SESSION_SETUP => Some(self.handle_session_setup(request_header, &mut cursor)),
-            COMMAND_TREE_CONNECT => Some(self.handle_tree_connect(request_header, &mut cursor)),
-            COMMAND_CREATE => Some(self.handle_create(request_header, &mut cursor)),
-            COMMAND_CLOSE => Some(self.handle_close(request_header, &mut cursor)),
-            COMMAND_READ => Some(self.handle_read(request_header, &mut cursor)),
-            COMMAND_WRITE => Some(self.handle_write(request_header, &mut cursor)),
-            COMMAND_QUERY_DIRECTORY => {
-                Some(self.handle_query_directory(request_header, &mut cursor))
-            }
-            COMMAND_TREE_DISCONNECT => {
-                Some(self.handle_tree_disconnect(request_header, &mut cursor))
-            }
-            COMMAND_LOGOFF => Some(self.handle_logoff(request_header, &mut cursor)),
-            COMMAND_FLUSH => Some(self.handle_flush(request_header, &mut cursor)),
-            COMMAND_ECHO => Some(self.handle_echo(request_header, &mut cursor)),
-            COMMAND_QUERY_INFO => Some(self.handle_query_info(request_header, &mut cursor)),
-            COMMAND_SET_INFO => Some(self.handle_set_info(request_header, &mut cursor)),
-            _ => None,
-        }
+        Some(match request_header.command {
+            COMMAND_NEGOTIATE => self.handle_negotiate(request_header, &mut cursor),
+            COMMAND_SESSION_SETUP => self.handle_session_setup(request_header, &mut cursor),
+            COMMAND_TREE_CONNECT => self.handle_tree_connect(request_header, &mut cursor),
+            COMMAND_CREATE => self.handle_create(request_header, &mut cursor),
+            COMMAND_CLOSE => self.handle_close(request_header, &mut cursor),
+            COMMAND_READ => self.handle_read(request_header, &mut cursor),
+            COMMAND_WRITE => self.handle_write(request_header, &mut cursor),
+            COMMAND_QUERY_DIRECTORY => self.handle_query_directory(request_header, &mut cursor),
+            COMMAND_TREE_DISCONNECT => self.handle_tree_disconnect(request_header, &mut cursor),
+            COMMAND_LOGOFF => self.handle_logoff(request_header, &mut cursor),
+            COMMAND_FLUSH => self.handle_flush(request_header, &mut cursor),
+            COMMAND_ECHO => self.handle_echo(request_header, &mut cursor),
+            COMMAND_QUERY_INFO => self.handle_query_info(request_header, &mut cursor),
+            COMMAND_SET_INFO => self.handle_set_info(request_header, &mut cursor),
+            _ => self.error_response(request_header, STATUS_NOT_SUPPORTED),
+        })
     }
 
     fn handle_set_info(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
@@ -888,65 +909,66 @@ impl ConnectionState {
             return self.error_response(request_header, STATUS_INVALID_PARAMETER);
         }
 
-        if request.flags & QUERY_DIR_FLAG_RESTART_SCANS != 0 {
-            self.listed_dirs.remove(&request.file_id_volatile);
+        let restart = request.flags & QUERY_DIR_FLAG_RESTART_SCANS != 0;
+        if restart {
+            self.pending_listings.remove(&request.file_id_volatile);
         }
 
-        if self.listed_dirs.contains(&request.file_id_volatile) {
+        // Initialize the pending list on first call (or after RESTART_SCANS).
+        if !self.pending_listings.contains_key(&request.file_id_volatile) {
+            let entries = match handle.list_children() {
+                Ok(e) => e,
+                Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
+            };
+            let pattern = decode_utf16le(&request.file_name).ok();
+            let filtered: VecDeque<DirEntry> = entries
+                .into_iter()
+                .filter(|e| match pattern.as_deref() {
+                    None | Some("") | Some("*") => true,
+                    Some(p) => glob_match(p, &e.name),
+                })
+                .collect();
+            self.pending_listings
+                .insert(request.file_id_volatile, filtered);
+        }
+
+        let pending = self
+            .pending_listings
+            .get_mut(&request.file_id_volatile)
+            .expect("just inserted");
+
+        if pending.is_empty() {
+            self.pending_listings.remove(&request.file_id_volatile);
             return self.error_response(request_header, STATUS_NO_MORE_FILES);
         }
 
-        let entries = match handle.list_children() {
-            Ok(e) => e,
-            Err(_) => return self.error_response(request_header, STATUS_INVALID_PARAMETER),
-        };
-
-        let pattern = decode_utf16le(&request.file_name).ok();
-        let entries: Vec<DirEntry> = entries
-            .into_iter()
-            .filter(|e| match pattern.as_deref() {
-                None | Some("") | Some("*") => true,
-                Some(p) => glob_match(p, &e.name),
-            })
-            .collect();
-
-        if entries.is_empty() {
-            self.listed_dirs.insert(request.file_id_volatile);
-            return self.error_response(request_header, STATUS_NO_MORE_FILES);
+        // Peel entries that fit into the client's output buffer.
+        let limit = request.output_buffer_length as usize;
+        let mut taken = 0;
+        let mut total_size = 0usize;
+        for entry in pending.iter() {
+            let s = file_both_dir_entry_wire_size(entry);
+            if total_size + s > limit {
+                break;
+            }
+            total_size += s;
+            taken += 1;
         }
 
-        let buffer = marshal_dir_entries(&entries);
-        self.listed_dirs.insert(request.file_id_volatile);
+        if taken == 0 {
+            // Even one entry doesn't fit. Spec: STATUS_INFO_LENGTH_MISMATCH.
+            return self.error_response(request_header, STATUS_INFO_LENGTH_MISMATCH);
+        }
 
-        let response_header = Header {
-            structure_size: 64,
-            credit_charge: 0,
-            status: STATUS_SUCCESS,
-            command: COMMAND_QUERY_DIRECTORY,
-            credits: 1,
-            flags: SMB2_FLAGS_SERVER_TO_REDIR,
-            next_command: 0,
-            message_id: request_header.message_id,
-            reserved: 0,
-            tree_id: request_header.tree_id,
-            session_id: request_header.session_id,
-            signature: [0; 16],
-        };
+        let chunk: Vec<DirEntry> = pending.drain(..taken).collect();
+        let buffer = marshal_dir_entries(&chunk);
 
+        let response_header = self.simple_response_header(&request_header, COMMAND_QUERY_DIRECTORY);
         let response_body = QueryDirectoryResponse {
             structure_size: 9,
             output_buffer: buffer,
         };
-
-        let mut bytes = Vec::with_capacity(64 + 8 + response_body.output_buffer.len());
-        let mut out = Cursor::new(&mut bytes);
-        response_header
-            .write(&mut out)
-            .expect("header serialize cannot fail");
-        response_body
-            .write(&mut out)
-            .expect("query_directory response serialize cannot fail");
-        bytes
+        write_response(response_header, response_body, total_size + 8)
     }
 
     fn handle_write(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
@@ -1070,7 +1092,7 @@ impl ConnectionState {
         // Pull the handle out, snapshot whatever we need from it before
         // dropping (so the FS sees no live handle when delete runs).
         let entry = self.open_files.remove(&request.file_id_volatile);
-        self.listed_dirs.remove(&request.file_id_volatile);
+        self.pending_listings.remove(&request.file_id_volatile);
         let size = entry.as_ref().map(|e| e.handle.size()).unwrap_or(0);
         let to_delete = entry
             .as_ref()
