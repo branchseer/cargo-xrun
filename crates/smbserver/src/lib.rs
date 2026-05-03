@@ -79,6 +79,7 @@ use wire::tree_disconnect::{TreeDisconnectRequest, TreeDisconnectResponse};
 use wire::write::{WriteRequest, WriteResponse};
 
 const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
+const SMB2_FLAGS_ASYNC_COMMAND: u32 = 0x0000_0002;
 const COMMAND_NEGOTIATE: u16 = 0x0000;
 const COMMAND_SESSION_SETUP: u16 = 0x0001;
 const COMMAND_LOGOFF: u16 = 0x0002;
@@ -96,6 +97,7 @@ const COMMAND_QUERY_INFO: u16 = 0x0010;
 const COMMAND_SET_INFO: u16 = 0x0011;
 const COMMAND_CANCEL: u16 = 0x000C;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
+const STATUS_PENDING: u32 = 0x0000_0103;
 const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
@@ -240,22 +242,23 @@ impl Server {
 
 /// Body of the CHANGE_NOTIFY background task: race the watcher's next
 /// event against the CANCEL oneshot, then build the appropriate
-/// response PDU bytes.
+/// response PDU bytes (always with FLAGS_ASYNC_COMMAND + AsyncId).
 async fn run_change_notify(
     mut watcher: Box<dyn Watcher>,
     cancel_rx: oneshot::Receiver<()>,
     request_header: Header,
+    async_id: u64,
     buffer_limit: u32,
 ) -> Vec<u8> {
     tokio::select! {
         biased;
         _ = cancel_rx => {
-            error_response_for(&request_header, STATUS_CANCELLED)
+            async_error_response(&request_header, async_id, STATUS_CANCELLED)
         }
         events = watcher.next() => {
             match events {
-                Some(events) => build_change_notify_success(&request_header, &events, buffer_limit),
-                None => error_response_for(&request_header, STATUS_NOT_SUPPORTED),
+                Some(events) => build_change_notify_success(&request_header, async_id, &events, buffer_limit),
+                None => async_error_response(&request_header, async_id, STATUS_NOT_SUPPORTED),
             }
         }
     }
@@ -263,16 +266,84 @@ async fn run_change_notify(
 
 fn build_change_notify_success(
     request_header: &Header,
+    async_id: u64,
     events: &[DirChange],
     buffer_limit: u32,
 ) -> Vec<u8> {
     let buffer = marshal_file_notify_information(events, buffer_limit as usize);
-    let response_header = simple_success_header(request_header, COMMAND_CHANGE_NOTIFY);
+    let response_header = async_success_header(request_header, async_id, COMMAND_CHANGE_NOTIFY);
     let response_body = ChangeNotifyResponse {
         structure_size: 9,
         buffer,
     };
     write_response(response_header, response_body, 0)
+}
+
+/// Build the interim STATUS_PENDING response that goes out immediately
+/// for any deferred async request, carrying the assigned AsyncId.
+fn build_interim_pending(request_header: &Header, async_id: u64) -> Vec<u8> {
+    let response_header = Header {
+        structure_size: 64,
+        credit_charge: 0,
+        status: STATUS_PENDING,
+        command: request_header.command,
+        credits: 1,
+        flags: SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND,
+        next_command: 0,
+        message_id: request_header.message_id,
+        reserved: async_id as u32,
+        tree_id: (async_id >> 32) as u32,
+        session_id: request_header.session_id,
+        signature: [0; 16],
+    };
+    let response_body = ErrorResponse {
+        structure_size: 9,
+        error_context_count: 0,
+        reserved: 0,
+        error_data: vec![0],
+    };
+    write_response(response_header, response_body, 9)
+}
+
+fn async_success_header(request_header: &Header, async_id: u64, command: u16) -> Header {
+    Header {
+        structure_size: 64,
+        credit_charge: 0,
+        status: STATUS_SUCCESS,
+        command,
+        credits: 1,
+        flags: SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND,
+        next_command: 0,
+        message_id: request_header.message_id,
+        reserved: async_id as u32,
+        tree_id: (async_id >> 32) as u32,
+        session_id: request_header.session_id,
+        signature: [0; 16],
+    }
+}
+
+fn async_error_response(request_header: &Header, async_id: u64, status: u32) -> Vec<u8> {
+    let response_header = Header {
+        structure_size: 64,
+        credit_charge: 0,
+        status,
+        command: request_header.command,
+        credits: 1,
+        flags: SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND,
+        next_command: 0,
+        message_id: request_header.message_id,
+        reserved: async_id as u32,
+        tree_id: (async_id >> 32) as u32,
+        session_id: request_header.session_id,
+        signature: [0; 16],
+    };
+    let response_body = ErrorResponse {
+        structure_size: 9,
+        error_context_count: 0,
+        reserved: 0,
+        error_data: vec![0],
+    };
+    write_response(response_header, response_body, 9)
 }
 
 fn marshal_file_notify_information(events: &[DirChange], limit: usize) -> Vec<u8> {
@@ -746,9 +817,12 @@ struct ConnectionState {
     /// Channel to the writer task; deferred handlers (CHANGE_NOTIFY)
     /// publish their eventual responses through here.
     tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// Active long-running requests, keyed by MessageId. CANCEL signals
-    /// the corresponding oneshot to wake the parked task.
+    /// Active long-running requests, keyed by AsyncId (which we assign
+    /// per request and echo back in the interim STATUS_PENDING response).
+    /// CANCEL signals the corresponding oneshot to wake the parked task.
     cancellations: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>>,
+    /// Counter for AsyncId issuance — never zero.
+    next_async_id: u64,
 }
 
 impl ConnectionState {
@@ -762,6 +836,7 @@ impl ConnectionState {
             next_tree_id: 1,
             tx,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            next_async_id: 1,
         }
     }
 
@@ -803,8 +878,17 @@ impl ConnectionState {
     }
 
     fn handle_cancel(&mut self, request_header: Header) {
+        // Async cancellations use the AsyncId (overlay of reserved+tree_id).
+        // Sync cancellations would use MessageId — we don't generate any
+        // sync long-running responses, so this branch is reachable only in
+        // unusual client flows.
+        let key = if request_header.flags & SMB2_FLAGS_ASYNC_COMMAND != 0 {
+            ((request_header.tree_id as u64) << 32) | (request_header.reserved as u64)
+        } else {
+            request_header.message_id
+        };
         if let Ok(mut map) = self.cancellations.lock()
-            && let Some(canceller) = map.remove(&request_header.message_id)
+            && let Some(canceller) = map.remove(&key)
         {
             let _ = canceller.send(());
         }
@@ -842,21 +926,35 @@ impl ConnectionState {
             None => return Some(self.error_response(request_header, STATUS_NOT_SUPPORTED)),
         };
 
+        // Allocate an AsyncId so the client can target this request with
+        // an async CANCEL.
+        let async_id = self.next_async_id;
+        self.next_async_id += 1;
+
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         if let Ok(mut map) = self.cancellations.lock() {
-            map.insert(request_header.message_id, cancel_tx);
+            map.insert(async_id, cancel_tx);
         }
+
+        // Send the interim STATUS_PENDING response immediately so the
+        // client knows the AsyncId for this long-running request.
+        let interim = build_interim_pending(&request_header, async_id);
+        let _ = self.tx.send(frame_pdu(&interim));
 
         let tx = self.tx.clone();
         let cancellations = self.cancellations.clone();
         let buffer_limit = request.output_buffer_length;
-        let mid = request_header.message_id;
         tokio::spawn(async move {
-            let response =
-                run_change_notify(watcher, cancel_rx, request_header, buffer_limit).await;
-            // Remove the cancellation entry — task is done either way.
+            let response = run_change_notify(
+                watcher,
+                cancel_rx,
+                request_header,
+                async_id,
+                buffer_limit,
+            )
+            .await;
             if let Ok(mut map) = cancellations.lock() {
-                map.remove(&mid);
+                map.remove(&async_id);
             }
             let _ = tx.send(frame_pdu(&response));
         });
