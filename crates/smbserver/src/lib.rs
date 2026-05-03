@@ -222,7 +222,7 @@ impl Server {
                 break Err(e);
             }
 
-            if let Some(response) = conn.handle_pdu(&pdu) {
+            if let Some(response) = conn.handle_pdu_chain(&pdu) {
                 let frame = frame_pdu(&response);
                 if tx.send(frame).is_err() {
                     break Ok(());
@@ -838,6 +838,57 @@ impl ConnectionState {
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             next_async_id: 1,
         }
+    }
+
+    /// Walk a (possibly-compound) PDU, dispatch each chained command,
+    /// concatenate the immediate responses (deferred ones publish via
+    /// `tx` independently), patching `next_command` so the client can
+    /// parse the chain.
+    fn handle_pdu_chain(&mut self, pdu: &[u8]) -> Option<Vec<u8>> {
+        let mut pos = 0usize;
+        let mut responses: Vec<Vec<u8>> = Vec::new();
+        loop {
+            // Peek the header to find next_command.
+            let mut hdr_cursor = Cursor::new(&pdu[pos..]);
+            let header = Header::read(&mut hdr_cursor).ok()?;
+            let next = header.next_command as usize;
+            let cmd_end = if next == 0 { pdu.len() } else { pos + next };
+            let cmd_pdu = &pdu[pos..cmd_end];
+
+            if let Some(resp) = self.handle_pdu(cmd_pdu) {
+                responses.push(resp);
+            }
+            // None = deferred; the spawned task will publish its own framed PDU.
+
+            if next == 0 {
+                break;
+            }
+            pos = cmd_end;
+        }
+
+        if responses.is_empty() {
+            return None;
+        }
+
+        // Concatenate with 8-byte padding between responses; patch
+        // next_command in every response except the last.
+        let mut combined: Vec<u8> = Vec::new();
+        let mut starts = Vec::with_capacity(responses.len());
+        for resp in &responses {
+            while combined.len() % 8 != 0 {
+                combined.push(0);
+            }
+            starts.push(combined.len());
+            combined.extend_from_slice(resp);
+        }
+        for i in 0..responses.len().saturating_sub(1) {
+            let here = starts[i];
+            let there = starts[i + 1];
+            let delta = (there - here) as u32;
+            // next_command lives at offset 20 in the SMB2 header.
+            combined[here + 20..here + 24].copy_from_slice(&delta.to_le_bytes());
+        }
+        Some(combined)
     }
 
     fn handle_pdu(&mut self, pdu: &[u8]) -> Option<Vec<u8>> {
