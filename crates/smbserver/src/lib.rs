@@ -193,6 +193,7 @@ impl Server {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        tracing::debug!("smbserver: connection opened");
         let (mut reader, mut writer) = tokio::io::split(io);
         // Outbound channel — handlers send framed PDU bytes; the writer
         // task drains them serially so deferred handlers (CHANGE_NOTIFY,
@@ -236,6 +237,10 @@ impl Server {
         drop(conn);
         drop(tx);
         let _ = writer_task.await;
+        match &read_result {
+            Ok(()) => tracing::debug!("smbserver: connection closed cleanly"),
+            Err(e) => tracing::warn!("smbserver: connection closed with error: {e}"),
+        }
         read_result
     }
 }
@@ -417,6 +422,29 @@ fn simple_success_header(request_header: &Header, command: u16) -> Header {
         tree_id: request_header.tree_id,
         session_id: request_header.session_id,
         signature: [0; 16],
+    }
+}
+
+/// Human-readable command name for logging.
+fn command_name(command: u16) -> &'static str {
+    match command {
+        COMMAND_NEGOTIATE => "NEGOTIATE",
+        COMMAND_SESSION_SETUP => "SESSION_SETUP",
+        COMMAND_LOGOFF => "LOGOFF",
+        COMMAND_TREE_CONNECT => "TREE_CONNECT",
+        COMMAND_TREE_DISCONNECT => "TREE_DISCONNECT",
+        COMMAND_CREATE => "CREATE",
+        COMMAND_CLOSE => "CLOSE",
+        COMMAND_FLUSH => "FLUSH",
+        COMMAND_READ => "READ",
+        COMMAND_WRITE => "WRITE",
+        COMMAND_CANCEL => "CANCEL",
+        COMMAND_ECHO => "ECHO",
+        COMMAND_QUERY_DIRECTORY => "QUERY_DIRECTORY",
+        COMMAND_CHANGE_NOTIFY => "CHANGE_NOTIFY",
+        COMMAND_QUERY_INFO => "QUERY_INFO",
+        COMMAND_SET_INFO => "SET_INFO",
+        _ => "UNKNOWN",
     }
 }
 
@@ -900,6 +928,11 @@ impl ConnectionState {
             Err(_) => return None,
         };
 
+        tracing::trace!(
+            command = command_name(request_header.command),
+            message_id = request_header.message_id,
+            "dispatch"
+        );
         match request_header.command {
             COMMAND_NEGOTIATE => Some(self.handle_negotiate(request_header, &mut cursor)),
             COMMAND_SESSION_SETUP => Some(self.handle_session_setup(request_header, &mut cursor)),
@@ -1614,6 +1647,11 @@ impl ConnectionState {
     }
 
     fn error_response(&self, request_header: Header, status: u32) -> Vec<u8> {
+        tracing::debug!(
+            command = command_name(request_header.command),
+            status = format_args!("{status:#010x}"),
+            "error"
+        );
         let response_header = Header {
             structure_size: 64,
             credit_charge: 0,

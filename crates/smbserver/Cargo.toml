@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 binrw = "0.14"
 tokio = { version = "1.48", features = ["io-util", "rt"] }
+tracing = "0.1"
 
 [dev-dependencies]
 smb = { version = "0.11", default-features = false, features = ["async", "sign", "encrypt"] }
