@@ -54,6 +54,58 @@ pub trait Filesystem: Send + Sync + 'static {
     fn volume_info(&self) -> VolumeInfo {
         VolumeInfo::default()
     }
+
+    /// Begin watching `dir_path` for changes (CHANGE_NOTIFY).
+    ///
+    /// Returning `None` means the backend does not support watching;
+    /// the server will reply STATUS_NOT_SUPPORTED so clients fall back
+    /// to polling. Backends that do support watching return a
+    /// [`Watcher`] whose `next` future yields the next batch of changes.
+    fn watch(&self, _dir_path: &str, _recursive: bool) -> Option<Box<dyn Watcher>> {
+        None
+    }
+}
+
+/// Asynchronous notification source for CHANGE_NOTIFY.
+///
+/// `next` resolves with the next batch of changes (one or more), or
+/// `None` if the watch is closed (the directory was removed, the
+/// backend gave up, etc.).
+pub trait Watcher: Send {
+    fn next<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<DirChange>>> + Send + 'a>>;
+}
+
+/// One change reported by a [`Watcher`].
+#[derive(Debug, Clone)]
+pub struct DirChange {
+    /// Path relative to the share root, using `/` as separator.
+    pub path: String,
+    pub kind: ChangeKind,
+}
+
+/// What happened to the file. Mirrors `FILE_ACTION_*` codes from
+/// MS-FSCC §2.4.42.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Modified,
+    RenamedOldName,
+    RenamedNewName,
+}
+
+impl ChangeKind {
+    pub fn as_action(self) -> u32 {
+        match self {
+            ChangeKind::Added => 0x0000_0001,
+            ChangeKind::Removed => 0x0000_0002,
+            ChangeKind::Modified => 0x0000_0003,
+            ChangeKind::RenamedOldName => 0x0000_0004,
+            ChangeKind::RenamedNewName => 0x0000_0005,
+        }
+    }
 }
 
 /// Volume-level metadata for QUERY_INFO type = FILESYSTEM responses.

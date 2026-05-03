@@ -128,6 +128,15 @@ struct FileEntry {
 pub struct InMemoryFs {
     files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, FileEntry>>>,
     explicit_dirs: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Subscribers per directory path. `notify` fans out to all matching.
+    watchers: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                Vec<tokio::sync::mpsc::UnboundedSender<smbserver::DirChange>>,
+            >,
+        >,
+    >,
 }
 
 impl InMemoryFs {
@@ -166,6 +175,17 @@ impl InMemoryFs {
                 let prefix = format!("{path}/");
                 p.starts_with(&prefix)
             })
+    }
+
+    /// Push a synthetic change event to all watchers registered against
+    /// `dir_path`. Lets tests trigger CHANGE_NOTIFY responses on demand.
+    pub fn notify(&self, dir_path: &str, name: impl Into<String>, kind: smbserver::ChangeKind) {
+        let path = name.into();
+        if let Some(subs) = self.watchers.lock().unwrap().get_mut(dir_path) {
+            subs.retain(|tx| {
+                tx.send(smbserver::DirChange { path: path.clone(), kind }).is_ok()
+            });
+        }
     }
 
     /// Snapshot the current contents of `path`. Returns `None` if the file
@@ -258,6 +278,17 @@ impl smbserver::Filesystem for InMemoryFs {
         Ok(())
     }
 
+    fn watch(&self, dir_path: &str, _recursive: bool) -> Option<Box<dyn smbserver::Watcher>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<smbserver::DirChange>();
+        self.watchers
+            .lock()
+            .unwrap()
+            .entry(dir_path.to_string())
+            .or_default()
+            .push(tx);
+        Some(Box::new(MemWatcher { rx }))
+    }
+
     fn volume_info(&self) -> smbserver::VolumeInfo {
         smbserver::VolumeInfo {
             label: "InMemoryFs".to_string(),
@@ -329,6 +360,23 @@ impl InMemoryFs {
         // Stable ordering for deterministic tests.
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         entries
+    }
+}
+
+struct MemWatcher {
+    rx: tokio::sync::mpsc::UnboundedReceiver<smbserver::DirChange>,
+}
+
+impl smbserver::Watcher for MemWatcher {
+    fn next<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<Vec<smbserver::DirChange>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let first = self.rx.recv().await?;
+            Some(vec![first])
+        })
     }
 }
 

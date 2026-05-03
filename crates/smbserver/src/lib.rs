@@ -13,7 +13,7 @@
 //!     }
 //! }
 //!
-//! # async fn run<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(io: S) {
+//! # async fn run<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(io: S) {
 //! let server = Server::builder().share("public", MyFs).build();
 //! // For each accepted connection (TCP, in-process pipe, anything that
 //! // implements AsyncRead + AsyncWrite + Unpin + Send):
@@ -40,16 +40,19 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use binrw::{BinRead, BinWrite};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 
 pub mod fs;
 pub mod ntlmssp;
 pub mod wire;
 
-pub use fs::{DirEntry, FileHandle, FileMetadata, Filesystem, VolumeInfo};
+pub use fs::{
+    ChangeKind, DirChange, DirEntry, FileHandle, FileMetadata, Filesystem, VolumeInfo, Watcher,
+};
 
 use wire::close::{CloseRequest, CloseResponse};
 use wire::create::{CreateRequest, CreateResponse};
@@ -65,6 +68,7 @@ use wire::fscc::{
 use wire::header::Header;
 use wire::logoff::{LogoffRequest, LogoffResponse};
 use wire::negotiate::{NegotiateRequest, NegotiateResponse};
+use wire::change_notify::{ChangeNotifyRequest, ChangeNotifyResponse};
 use wire::query_directory::{QueryDirectoryRequest, QueryDirectoryResponse};
 use wire::query_info::{QueryInfoRequest, QueryInfoResponse};
 use wire::set_info::{SetInfoRequest, SetInfoResponse};
@@ -87,8 +91,10 @@ const COMMAND_READ: u16 = 0x0008;
 const COMMAND_WRITE: u16 = 0x0009;
 const COMMAND_ECHO: u16 = 0x000D;
 const COMMAND_QUERY_DIRECTORY: u16 = 0x000E;
+const COMMAND_CHANGE_NOTIFY: u16 = 0x000F;
 const COMMAND_QUERY_INFO: u16 = 0x0010;
 const COMMAND_SET_INFO: u16 = 0x0011;
+const COMMAND_CANCEL: u16 = 0x000C;
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -181,36 +187,175 @@ impl Server {
         ServerBuilder::default()
     }
 
-    pub async fn serve_connection<S>(&self, mut io: S) -> std::io::Result<()>
+    pub async fn serve_connection<S>(&self, io: S) -> std::io::Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let mut conn = ConnectionState::new(self.inner.clone());
-        loop {
-            // SMB-over-TCP transport header: 1-byte zero + 24-bit big-endian length.
+        let (mut reader, mut writer) = tokio::io::split(io);
+        // Outbound channel — handlers send framed PDU bytes; the writer
+        // task drains them serially so deferred handlers (CHANGE_NOTIFY,
+        // CANCEL) can fire from spawned tasks without sharing the writer.
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut conn = ConnectionState::new(self.inner.clone(), tx.clone());
+
+        let writer_task = tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                if writer.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let read_result = loop {
             let mut frame_header = [0u8; 4];
-            match io.read_exact(&mut frame_header).await {
+            match reader.read_exact(&mut frame_header).await {
                 Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
+                Err(e) => break Err(e),
             }
             let pdu_len = u32::from_be_bytes([0, frame_header[1], frame_header[2], frame_header[3]])
                 as usize;
             let mut pdu = vec![0u8; pdu_len];
-            io.read_exact(&mut pdu).await?;
+            if let Err(e) = reader.read_exact(&mut pdu).await {
+                break Err(e);
+            }
 
-            let response = match conn.handle_pdu(&pdu) {
-                Some(bytes) => bytes,
-                None => return Ok(()), // malformed header — close
-            };
+            if let Some(response) = conn.handle_pdu(&pdu) {
+                let frame = frame_pdu(&response);
+                if tx.send(frame).is_err() {
+                    break Ok(());
+                }
+            }
+            // None = handler deferred; will publish via tx when ready.
+        };
 
-            let len = response.len() as u32;
-            let mut frame = Vec::with_capacity(4 + response.len());
-            frame.extend_from_slice(&[0, (len >> 16) as u8, (len >> 8) as u8, len as u8]);
-            frame.extend_from_slice(&response);
-            io.write_all(&frame).await?;
+        // Drop conn (and the tx clone it holds) so the writer task knows
+        // no more frames are coming once any spawned handlers finish.
+        drop(conn);
+        drop(tx);
+        let _ = writer_task.await;
+        read_result
+    }
+}
+
+/// Body of the CHANGE_NOTIFY background task: race the watcher's next
+/// event against the CANCEL oneshot, then build the appropriate
+/// response PDU bytes.
+async fn run_change_notify(
+    mut watcher: Box<dyn Watcher>,
+    cancel_rx: oneshot::Receiver<()>,
+    request_header: Header,
+    buffer_limit: u32,
+) -> Vec<u8> {
+    tokio::select! {
+        biased;
+        _ = cancel_rx => {
+            error_response_for(&request_header, STATUS_CANCELLED)
+        }
+        events = watcher.next() => {
+            match events {
+                Some(events) => build_change_notify_success(&request_header, &events, buffer_limit),
+                None => error_response_for(&request_header, STATUS_NOT_SUPPORTED),
+            }
         }
     }
+}
+
+fn build_change_notify_success(
+    request_header: &Header,
+    events: &[DirChange],
+    buffer_limit: u32,
+) -> Vec<u8> {
+    let buffer = marshal_file_notify_information(events, buffer_limit as usize);
+    let response_header = simple_success_header(request_header, COMMAND_CHANGE_NOTIFY);
+    let response_body = ChangeNotifyResponse {
+        structure_size: 9,
+        buffer,
+    };
+    write_response(response_header, response_body, 0)
+}
+
+fn marshal_file_notify_information(events: &[DirChange], limit: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut entry_starts = Vec::with_capacity(events.len());
+    for event in events {
+        let name_bytes: Vec<u8> = event
+            .path
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let entry_size = 12 + name_bytes.len();
+        let aligned = (entry_size + 3) & !3; // FileNotifyInformation aligns to 4
+        if !buf.is_empty() && buf.len() + aligned > limit {
+            break;
+        }
+        let start = buf.len();
+        entry_starts.push(start);
+        buf.extend_from_slice(&0u32.to_le_bytes()); // next_entry_offset (patched)
+        buf.extend_from_slice(&event.kind.as_action().to_le_bytes());
+        buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&name_bytes);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+    }
+    for i in 0..entry_starts.len().saturating_sub(1) {
+        let here = entry_starts[i];
+        let next = entry_starts[i + 1];
+        let delta = (next - here) as u32;
+        buf[here..here + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+    buf
+}
+
+fn error_response_for(request_header: &Header, status: u32) -> Vec<u8> {
+    let response_header = Header {
+        structure_size: 64,
+        credit_charge: 0,
+        status,
+        command: request_header.command,
+        credits: 1,
+        flags: SMB2_FLAGS_SERVER_TO_REDIR,
+        next_command: 0,
+        message_id: request_header.message_id,
+        reserved: 0,
+        tree_id: request_header.tree_id,
+        session_id: request_header.session_id,
+        signature: [0; 16],
+    };
+    let response_body = ErrorResponse {
+        structure_size: 9,
+        error_context_count: 0,
+        reserved: 0,
+        error_data: vec![0],
+    };
+    write_response(response_header, response_body, 9)
+}
+
+fn simple_success_header(request_header: &Header, command: u16) -> Header {
+    Header {
+        structure_size: 64,
+        credit_charge: 0,
+        status: STATUS_SUCCESS,
+        command,
+        credits: 1,
+        flags: SMB2_FLAGS_SERVER_TO_REDIR,
+        next_command: 0,
+        message_id: request_header.message_id,
+        reserved: 0,
+        tree_id: request_header.tree_id,
+        session_id: request_header.session_id,
+        signature: [0; 16],
+    }
+}
+
+/// Wrap an SMB2 PDU in the 4-byte SMB-over-TCP transport header.
+fn frame_pdu(pdu: &[u8]) -> Vec<u8> {
+    let len = pdu.len() as u32;
+    let mut frame = Vec::with_capacity(4 + pdu.len());
+    frame.extend_from_slice(&[0, (len >> 16) as u8, (len >> 8) as u8, len as u8]);
+    frame.extend_from_slice(pdu);
+    frame
 }
 
 impl ServerBuilder {
@@ -598,10 +743,16 @@ struct ConnectionState {
     /// TREE_CONNECT, cleared on TREE_DISCONNECT.
     trees: HashMap<u32, Arc<dyn Filesystem>>,
     next_tree_id: u32,
+    /// Channel to the writer task; deferred handlers (CHANGE_NOTIFY)
+    /// publish their eventual responses through here.
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Active long-running requests, keyed by MessageId. CANCEL signals
+    /// the corresponding oneshot to wake the parked task.
+    cancellations: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>>,
 }
 
 impl ConnectionState {
-    fn new(inner: Arc<Inner>) -> Self {
+    fn new(inner: Arc<Inner>, tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
         Self {
             inner,
             open_files: HashMap::new(),
@@ -609,6 +760,8 @@ impl ConnectionState {
             pending_listings: HashMap::new(),
             trees: HashMap::new(),
             next_tree_id: 1,
+            tx,
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -621,23 +774,94 @@ impl ConnectionState {
             Err(_) => return None,
         };
 
-        Some(match request_header.command {
-            COMMAND_NEGOTIATE => self.handle_negotiate(request_header, &mut cursor),
-            COMMAND_SESSION_SETUP => self.handle_session_setup(request_header, &mut cursor),
-            COMMAND_TREE_CONNECT => self.handle_tree_connect(request_header, &mut cursor),
-            COMMAND_CREATE => self.handle_create(request_header, &mut cursor),
-            COMMAND_CLOSE => self.handle_close(request_header, &mut cursor),
-            COMMAND_READ => self.handle_read(request_header, &mut cursor),
-            COMMAND_WRITE => self.handle_write(request_header, &mut cursor),
-            COMMAND_QUERY_DIRECTORY => self.handle_query_directory(request_header, &mut cursor),
-            COMMAND_TREE_DISCONNECT => self.handle_tree_disconnect(request_header, &mut cursor),
-            COMMAND_LOGOFF => self.handle_logoff(request_header, &mut cursor),
-            COMMAND_FLUSH => self.handle_flush(request_header, &mut cursor),
-            COMMAND_ECHO => self.handle_echo(request_header, &mut cursor),
-            COMMAND_QUERY_INFO => self.handle_query_info(request_header, &mut cursor),
-            COMMAND_SET_INFO => self.handle_set_info(request_header, &mut cursor),
-            _ => self.error_response(request_header, STATUS_NOT_SUPPORTED),
-        })
+        match request_header.command {
+            COMMAND_NEGOTIATE => Some(self.handle_negotiate(request_header, &mut cursor)),
+            COMMAND_SESSION_SETUP => Some(self.handle_session_setup(request_header, &mut cursor)),
+            COMMAND_TREE_CONNECT => Some(self.handle_tree_connect(request_header, &mut cursor)),
+            COMMAND_CREATE => Some(self.handle_create(request_header, &mut cursor)),
+            COMMAND_CLOSE => Some(self.handle_close(request_header, &mut cursor)),
+            COMMAND_READ => Some(self.handle_read(request_header, &mut cursor)),
+            COMMAND_WRITE => Some(self.handle_write(request_header, &mut cursor)),
+            COMMAND_QUERY_DIRECTORY => {
+                Some(self.handle_query_directory(request_header, &mut cursor))
+            }
+            COMMAND_TREE_DISCONNECT => {
+                Some(self.handle_tree_disconnect(request_header, &mut cursor))
+            }
+            COMMAND_LOGOFF => Some(self.handle_logoff(request_header, &mut cursor)),
+            COMMAND_FLUSH => Some(self.handle_flush(request_header, &mut cursor)),
+            COMMAND_ECHO => Some(self.handle_echo(request_header, &mut cursor)),
+            COMMAND_QUERY_INFO => Some(self.handle_query_info(request_header, &mut cursor)),
+            COMMAND_SET_INFO => Some(self.handle_set_info(request_header, &mut cursor)),
+            COMMAND_CHANGE_NOTIFY => self.handle_change_notify(request_header, &mut cursor),
+            COMMAND_CANCEL => {
+                self.handle_cancel(request_header);
+                None
+            }
+            _ => Some(self.error_response(request_header, STATUS_NOT_SUPPORTED)),
+        }
+    }
+
+    fn handle_cancel(&mut self, request_header: Header) {
+        if let Ok(mut map) = self.cancellations.lock()
+            && let Some(canceller) = map.remove(&request_header.message_id)
+        {
+            let _ = canceller.send(());
+        }
+    }
+
+    /// CHANGE_NOTIFY: returns `None` (deferred). Spawns a task that
+    /// waits on either the next watch event or a CANCEL signal, then
+    /// publishes the response through `self.tx`.
+    fn handle_change_notify(
+        &mut self,
+        request_header: Header,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        let request = match ChangeNotifyRequest::read(cursor) {
+            Ok(r) => r,
+            Err(_) => return Some(self.error_response(request_header, STATUS_INVALID_PARAMETER)),
+        };
+
+        let entry = match self.open_files.get(&request.file_id_volatile) {
+            Some(of) => of,
+            None => return Some(self.error_response(request_header, STATUS_FILE_CLOSED)),
+        };
+        if !entry.handle.is_directory() {
+            return Some(self.error_response(request_header, STATUS_INVALID_PARAMETER));
+        }
+        let path = entry.path.clone();
+
+        let fs = match self.trees.get(&request_header.tree_id) {
+            Some(fs) => fs.clone(),
+            None => return Some(self.error_response(request_header, STATUS_INVALID_PARAMETER)),
+        };
+
+        let watcher = match fs.watch(&path, request.flags & 0x0001 != 0 /* WATCH_TREE */) {
+            Some(w) => w,
+            None => return Some(self.error_response(request_header, STATUS_NOT_SUPPORTED)),
+        };
+
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        if let Ok(mut map) = self.cancellations.lock() {
+            map.insert(request_header.message_id, cancel_tx);
+        }
+
+        let tx = self.tx.clone();
+        let cancellations = self.cancellations.clone();
+        let buffer_limit = request.output_buffer_length;
+        let mid = request_header.message_id;
+        tokio::spawn(async move {
+            let response =
+                run_change_notify(watcher, cancel_rx, request_header, buffer_limit).await;
+            // Remove the cancellation entry — task is done either way.
+            if let Ok(mut map) = cancellations.lock() {
+                map.remove(&mid);
+            }
+            let _ = tx.send(frame_pdu(&response));
+        });
+
+        None
     }
 
     fn handle_set_info(&mut self, request_header: Header, cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
